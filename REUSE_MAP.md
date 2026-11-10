@@ -37,13 +37,13 @@ present in any of the three.
 
 | # | Requirement | Source | Action | Note |
 |---|---|---|---|---|
-| 2.1 | "Implement the jcode adapter using the narrowest stable interface" | — | **new** | Listed in section 3 as a thin adapter. Reason new: no upstream project exposes jcode's process surface as a library |
+| 2.1 | "Implement the jcode adapter using the narrowest stable interface" | jcode process surface | **glue** | the adapter is glue per section 4; checked jcode and BlockCell, neither exposes jcode's process surface as a library, so the thin wrapper is glue joining two runtimes |
 | 2.2 | "Launch jcode in a controlled repository/worktree scope" | jcode worktree support | **use as is** | jcode already has optional worktrees and file-touch notifications; call them, do not rebuild them |
 | 2.3 | "Pass task IDs, acceptance criteria, budgets and allowed operations" | BlockCell `crates/core/src/{budget,task_contract,scope}.rs` | **copy in** | BlockCell already models budgets, task contracts and scope. Wrap those types |
 | 2.4 | "Capture worker and swarm lifecycle events" | jcode event surface | **use as is** | read jcode's lifecycle events; add only the trace identifier |
-| 2.5 | "Collect typed task artifacts and evidence" | — | **new** | Telemetry, listed in section 3 |
-| 2.6 | "Reconcile status after timeouts, crashes and supervisor restarts" | — | **new** | part of the adapter in 2.1 |
-| 2.7 | "Add integration tests for cancellation, restart and duplicate dispatch" | — | **new** | integration tests are explicitly required, and are not upstream tests |
+| 2.5 | "Collect typed task artifacts and evidence" | BlockCell audit log, `crates/core` | **copy** + **glue** | the append-only log is BlockCell's; the typed artifact envelope is glue |
+| 2.6 | "Reconcile status after timeouts, crashes and supervisor restarts" | beads `claim.go` | **port-adapt** | Go to Rust; the claim and status-reconciliation logic is ported, not rewritten |
+| 2.7 | "Add integration tests for cancellation, restart and duplicate dispatch" | — | **glue** | integration tests are explicitly required by the document and are not upstream tests, so they are glue |
 
 ## Phase 3 — Add Graphicle as code intelligence
 
@@ -52,18 +52,18 @@ present in any of the three.
 | 3.1 | "Start Graphicle for a repository/workspace" | graphicle release binary | **use as is** | `graphicle-<ver>-x86_64-unknown-linux-gnu.tar.gz`, checksum-verified. Never built from source |
 | 3.2 | "Run code-only indexing first" | graphicle's own indexer | **use as is** | |
 | 3.3 | "Expose its MCP tools to jcode and TurboHermes" | graphicle `serve.rs`, 10 tools | **use as is** | `query_graph`, `get_node`, `get_neighbors`, `get_community`, `god_nodes`, `graph_stats`, `shortest_path`, `list_prs`, `get_pr_impact`, `triage_prs` |
-| 3.4 | "Build a typed adapter for code queries and cited context" | — | **new** | Listed in section 3 as a thin adapter |
-| 3.5 | "Preserve file/line/symbol references in task artifacts" | — | **new** | Telemetry, section 3 |
-| 3.6 | "Test incremental sync after edits, branch changes and merges" | — | **new** | integration tests |
+| 3.4 | "Build a typed adapter for code queries and cited context" | graphicle MCP `serve.rs` | **glue** | the adapter is glue; the 10 MCP tools and 6 resources are used as is |
+| 3.5 | "Preserve file/line/symbol references in task artifacts" | graphicle `_built_at_commit` pattern | **copy** + **glue** | the reference shape is graphicle's; the artifact field is glue |
+| 3.6 | "Test incremental sync after edits, branch changes and merges" | — | **glue** | integration tests, glue |
 | 3.7 | "Add staleness detection for memories linked to changed symbols" | graphicle `_built_at_commit` + `build_commit_line()` | **copy in** | graphicle already solves this: it records the build commit and compares to git HEAD because an MCP client cannot stat graph.json. Copy the pattern |
 
 ## Phase 4+ components that section 3 makes new
 
 | Component | Source primitives to check first | Action |
 |---|---|---|
-| Memory service | SQLite + FTS5, rusqlite, tree-sitter, jcode's memory code, BlockCell `crates/storage` and `ghost_ledger.rs`, existing BM25 crates | **new** with bridging |
-| Telemetry (event log, trace ids, outcome collector) | BlockCell hash-chain audit log in `crates/core` | **new** |
-| DecisionProvider (Jev, Clef, Clef-Flash, deterministic) | Clef on Cloudflare Workers AI, LiteLLM `/v1/decisions` and `/v1/systemone` | **new** interface, **use as is** backends |
+| Memory service | jcode `memory.rs`/`memory_jev.rs`, moltis `crates/memory`, BlockCell `crates/storage` and `ghost_ledger.rs` | **copy** + **port-adapt** | |
+| Telemetry (event log, trace ids, outcome collector) | BlockCell hash-chain audit log in `crates/core` | **copy** + **glue** | |
+| DecisionProvider (Jev, Clef, Clef-Flash, deterministic) | jcode `jev.rs`; Clef on Cloudflare Workers AI; LiteLLM `/v1/decisions` and `/v1/systemone` | **glue** interface, **use as is** backends | |
 | TrajectoryCritic + OpenHands Critic adapter | OpenHands SDK critic on :8079 | **glue** |
 | Evaluation corpus tooling | — | **glue** |
 
