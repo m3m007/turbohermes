@@ -31,7 +31,7 @@ present in any of the three.
 | 1.3 | "Keep upstream history and define a regular upstream merge/rebase process" | in-repo docs | **fork + modify** | `docs/architecture/UPSTREAM-SYNC.md`, commands and cadence. No rebase, no squash: rename commits on top of the fork point |
 | 1.4 | "Preserve existing BlockCell functionality initially" | constraint on 1.2 | **new: test** | baseline test count is the pass mark. Not yet captured; first action in Phase 1 |
 | 1.5 | "Add TurboHermes-specific integration crates only where needed" | — | **new, only if needed** | default answer is none. A capability BlockCell already implements gets no crate |
-| 1.6 | "Add CI for formatting, clippy, unit tests, integration tests and licence checks" | standard + existing config | **copy in** | `cargo-deny` config already exists at `/home/hermes/projects/turbohermes/deny.toml`; copy it rather than write a new one |
+| 1.6 | "Add CI for formatting, clippy, unit tests, integration tests and licence checks" | standard + existing config | **copy** | `cargo-deny` config already exists at `/home/hermes/projects/turbohermes/deny.toml`; copy it rather than write a new one |
 
 ## Phase 2 — Add jcode as a supervised coding subsystem
 
@@ -39,7 +39,7 @@ present in any of the three.
 |---|---|---|---|---|
 | 2.1 | "Implement the jcode adapter using the narrowest stable interface" | jcode process surface | **glue** | the adapter is glue per section 4; checked jcode and BlockCell, neither exposes jcode's process surface as a library, so the thin wrapper is glue joining two runtimes |
 | 2.2 | "Launch jcode in a controlled repository/worktree scope" | jcode worktree support | **use as is** | jcode already has optional worktrees and file-touch notifications; call them, do not rebuild them |
-| 2.3 | "Pass task IDs, acceptance criteria, budgets and allowed operations" | BlockCell `crates/core/src/{budget,task_contract,scope}.rs` | **copy in** | BlockCell already models budgets, task contracts and scope. Wrap those types |
+| 2.3 | "Pass task IDs, acceptance criteria, budgets and allowed operations" | BlockCell `crates/core/src/{budget,task_contract,scope}.rs` | **copy** | BlockCell already models budgets, task contracts and scope. Wrap those types |
 | 2.4 | "Capture worker and swarm lifecycle events" | jcode event surface | **use as is** | read jcode's lifecycle events; add only the trace identifier |
 | 2.5 | "Collect typed task artifacts and evidence" | BlockCell audit log, `crates/core` | **copy** + **glue** | the append-only log is BlockCell's; the typed artifact envelope is glue |
 | 2.6 | "Reconcile status after timeouts, crashes and supervisor restarts" | beads `claim.go` | **port-adapt** | Go to Rust; the claim and status-reconciliation logic is ported, not rewritten |
@@ -55,7 +55,7 @@ present in any of the three.
 | 3.4 | "Build a typed adapter for code queries and cited context" | graphicle MCP `serve.rs` | **glue** | the adapter is glue; the 10 MCP tools and 6 resources are used as is |
 | 3.5 | "Preserve file/line/symbol references in task artifacts" | graphicle `_built_at_commit` pattern | **copy** + **glue** | the reference shape is graphicle's; the artifact field is glue |
 | 3.6 | "Test incremental sync after edits, branch changes and merges" | — | **glue** | integration tests, glue |
-| 3.7 | "Add staleness detection for memories linked to changed symbols" | graphicle `_built_at_commit` + `build_commit_line()` | **copy in** | graphicle already solves this: it records the build commit and compares to git HEAD because an MCP client cannot stat graph.json. Copy the pattern |
+| 3.7 | "Add staleness detection for memories linked to changed symbols" | graphicle `_built_at_commit` + `build_commit_line()` | **copy** | graphicle already solves this: it records the build commit and compares to git HEAD because an MCP client cannot stat graph.json. Copy the pattern |
 
 ## Phase 4+ components that section 3 makes new
 
