@@ -173,7 +173,7 @@ could be ported or adapted.
 | M9 | Vector and retrieval storage | kektordb | **port-adapt, evaluate first** | Go, Apache-2.0. jcode has removed vector recall and the document's retrieval design is a hybrid cascade, so this row is evaluated before it is adopted. Recorded so it is not silently skipped |
 | M10 | Telemetry: trace identifiers, outcome collector | BlockCell audit log; OpenHands learning-to-verify for outcome signals | **copy** + **glue** | the log is BlockCell's; the outcome-signal vocabulary comes from the OpenHands learning-to-verify design |
 | M11 | TrajectoryCritic + OpenHands Critic adapter | OpenHands SDK critic on :8079 | **glue** | the adapter is glue; the critic itself is an external service we talk to, never reimplemented |
-| M12 | Evaluation corpus tooling | — | **glue** | checked all section 2 sources; none holds an evaluation-corpus tool. The corpus format follows the document's acceptance tests in section 13 |
+| M12 | Evaluation corpus tooling | yantrikdb-server, aura-memory, graphicle, hindsight | **copy** + **glue** | **CORRECTED 2026-11-10 by the Phase 1 build.** My earlier row said "checked all section 2 sources; none holds an evaluation-corpus tool". That was false, and it survived 11 passes because it came from a name-pattern search rather than an observation. Four sources ship a real retrieval-quality harness: yantrikdb-server (a 500-question run, recall@5 80.6% stated as the substrate's pure-embedder ceiling), aura-memory (head-to-head against mem0, 89.2% vs 85.8% top-5), graphicle (`bench/memory/tools/retrieval_recall.py`), and hindsight (`hindsight-system-evals/`, whose own note is "Stub the model and you score the stub"). The corpus format is glue; the harness and the benchmark method are copied |
 
 ## What is deliberately NOT built
 
@@ -187,3 +187,27 @@ could be ported or adapted.
   and working.
 - No new decision engine. Clef is hosted and reachable on the verified account.
 - No local embeddings. API-only decision layer, per the owner's standing ruling.
+
+## Phase 1 source-verification results (2026-11-10, build proc_eccac26bde54)
+
+16 of 17 git clones match their pins exactly. **One does not:**
+
+- **jcode is detached at `7206efd0c`**, which is NOT an ancestor of the pin
+  `47e426e5f` and is dated 17 days EARLIER. That is a divergent line, not drift.
+  `master` still points at the pin and all eight cited paths were confirmed
+  against the object database, so every capability claim about jcode stands, but
+  the pin is not reproducible from the working tree. Not corrected by checkout:
+  that clone is shared with a concurrent jcode build.
+
+Other findings recorded, not fixed:
+- The Local dir column is a bare name with no base path. All 18 resolve under
+  `/home/hermes/projects/upstream/`, rusty-beads one level deeper.
+- Gitleaks clean across all 12 commits and on the deliverable itself. A full
+  worktree scan reports 14 leaks, all pre-existing fork documentation files,
+  none touched by the Phase 1 commits.
+
+**Security action taken the same day:** a live `ghp_` PAT was found in seven
+`.git/config` files, one of them in a malformed `[branch]` remote override rather
+than a remote URL, which is why a remote-URL sweep missed it. All seven stripped;
+remotes now hold plain HTTPS URLs and the credential is read from `.env` at push
+time only, verified by a push that left zero token references in config.
