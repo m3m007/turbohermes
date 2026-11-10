@@ -27,6 +27,13 @@ LOG = LOGDIR / "turbohermes-watch.log"
 KANBAN_DIR = Path("/home/hermes/projects/agent-daemon")
 ENV = Path("/home/hermes/.hermes/.env")
 ASSIGNEE = "jcode"
+# The standing policy. The model-lane table in section 1 is the single source of
+# truth for which model runs which phase; this script reads it rather than
+# hard-coding a model, because a hard-coded model is how the three-lane
+# instruction (GLM 5.3 architecture, step-5-preview grunt, deepseek verification)
+# silently became one lane running step-5-preview for everything.
+POLICY = KANBAN_DIR / "TURBOHERMES-POLICY.md"
+FALLBACK_MODEL = "step-5-preview"
 
 
 def log(msg):
@@ -88,7 +95,51 @@ def ready_tickets():
     return _ticket_ids(out)
 
 
+def model_for(ticket_id):
+    """The model for a ticket's phase, read from the standing policy.
+
+    Parses the "Model lanes" table in TURBOHERMES-POLICY.md section 1. The ticket
+    title carries the phase name (`v7 phase: <name>`), which is the join key. Falls
+    back to the workhorse model and says so in the log, so a missing row is loud
+    rather than silent.
+    """
+    rc, out = sh("hermes kanban show %s" % ticket_id, cwd=KANBAN_DIR)
+    title = ""
+    for line in out.splitlines():
+        if "v7 phase:" in line:
+            title = line.split("v7 phase:", 1)[1].strip()
+            break
+    phase = title.split()[0] if title else ""
+    if not phase:
+        log("model_for %s: no phase in title, using %s" % (ticket_id, FALLBACK_MODEL))
+        return FALLBACK_MODEL, "unknown"
+    if not POLICY.exists():
+        log("model_for %s: no policy file, using %s" % (ticket_id, FALLBACK_MODEL))
+        return FALLBACK_MODEL, phase
+    lanes = {}
+    in_table = False
+    for line in POLICY.read_text().splitlines():
+        if "Model lanes" in line:
+            in_table = True
+            continue
+        if in_table:
+            if line.startswith("##"):
+                break
+            if line.strip().startswith("|") and "---" not in line:
+                cells = [c.strip() for c in line.strip().strip("|").split("|")]
+                if len(cells) >= 3 and cells[0] and cells[0] != "Phase":
+                    lanes[cells[0]] = (cells[1], cells[2])
+    if phase not in lanes:
+        log("model_for %s: phase %s not in the policy lane table, using %s"
+            % (ticket_id, phase, FALLBACK_MODEL))
+        return FALLBACK_MODEL, phase
+    role, model = lanes[phase]
+    log("model_for %s: phase=%s role=%s model=%s" % (ticket_id, phase, role, model))
+    return model, phase
+
+
 def dispatch(ticket_id):
+    model, phase = model_for(ticket_id)
     rc, _ = sh("hermes kanban claim %s" % ticket_id, cwd=KANBAN_DIR)
     if rc != 0:
         log("dispatch %s: claim failed rc=%d" % (ticket_id, rc))
@@ -100,18 +151,19 @@ def dispatch(ticket_id):
     logf = LOGDIR / ("jcode-%s.log" % ticket_id)
     cmd = (
         "source %s 2>/dev/null; export JCODE_PROVIDER_LITELLM_API_KEY=\"%s\"; "
-        "jcode --provider-profile litellm --model step-5-preview run "
+        "jcode --provider-profile litellm --model %s run "
         "\"Run: hermes kanban show %s --body, read that body, and execute it "
         "exactly. Work order v7 is the authority: reuse before write, and name "
         "every upstream file you copy or port from. Report only what you ran "
         "and observed.\""
-        % (ENV, key, ticket_id)
+        % (ENV, key, model, ticket_id)
     )
     with open(logf, "a") as lf:
         subprocess.Popen(["bash", "-lc", cmd], cwd=str(KANBAN_DIR),
                          stdout=lf, stderr=subprocess.STDOUT,
                          start_new_session=True)
-    log("DISPATCHED %s to jcode, log %s" % (ticket_id, logf.name))
+    log("DISPATCHED %s (phase %s) to jcode on model %s, log %s"
+        % (ticket_id, phase, model, logf.name))
     return True
 
 
