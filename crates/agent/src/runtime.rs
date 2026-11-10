@@ -82,6 +82,7 @@ mod ghost_boundary;
 mod lightweight_handle;
 mod message_dispatch;
 mod message_task;
+mod mutation_checkpoint;
 pub mod pre_step;
 mod prefetch;
 mod process_message_inner;
@@ -2825,6 +2826,8 @@ pub struct AgentRuntime {
     tool_registry: ToolRegistry,
     session_store: SessionStore,
     audit_logger: Arc<Mutex<AuditLogger>>,
+    /// Pre-mutation filesystem checkpoints (ported from Moltis `auto_checkpoint.rs`).
+    mutation_checkpoints: mutation_checkpoint::MutationCheckpointer,
     outbound_tx: Option<mpsc::Sender<OutboundMessage>>,
     inbound_tx: Option<mpsc::Sender<InboundMessage>>,
     confirm_tx: Option<mpsc::Sender<ConfirmRequest>>,
@@ -3197,6 +3200,9 @@ impl AgentRuntime {
         let (steering, steering_sender) = SteeringChannel::new(16);
 
         let mut runtime = Self {
+            mutation_checkpoints: mutation_checkpoint::MutationCheckpointer::new(
+                paths.base.clone(),
+            ),
             config,
             paths,
             context_builder,
@@ -3301,6 +3307,9 @@ impl AgentRuntime {
         abort_token: AbortToken,
     ) -> Self {
         let mut runtime = Self {
+            mutation_checkpoints: mutation_checkpoint::MutationCheckpointer::new(
+                self.paths.base.clone(),
+            ),
             config: self.config.clone(),
             paths: self.paths.clone(),
             context_builder: self.context_builder.clone(),

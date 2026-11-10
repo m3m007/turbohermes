@@ -12,6 +12,7 @@ use crate::audio_transcribe::AudioTranscribeTool;
 use crate::browser::BrowseTool;
 use crate::camera::CameraCaptureTool;
 use crate::chart_generate::ChartGenerateTool;
+use crate::checkpoints::{CheckpointRestoreTool, CheckpointsListTool};
 use crate::code_search::{GlobTool, GrepTool};
 use crate::community_hub::CommunityHubTool;
 use crate::context_remaining::GetContextRemainingTool;
@@ -223,6 +224,10 @@ impl ToolRegistry {
 
         // File operations (delete, rename, move, copy, compress, decompress, PDF)
         registry.register(Arc::new(FileOpsTool));
+
+        // Filesystem checkpoints (list / restore snapshots taken before mutations)
+        registry.register(Arc::new(CheckpointsListTool));
+        registry.register(Arc::new(CheckpointRestoreTool));
 
         // Structured data processing (CSV, stats, query, transform)
         registry.register(Arc::new(DataProcessTool));

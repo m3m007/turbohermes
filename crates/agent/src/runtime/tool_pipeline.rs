@@ -117,6 +117,8 @@ pub(crate) struct ToolInvocation<'a> {
     pub(crate) dangerous_confirmed: bool,
     active_skill_dir: Option<PathBuf>,
     verification_policy: Option<blockcell_core::task_contract::VerificationPolicy>,
+    /// Filesystem checkpoints created before this call's mutation, in target order.
+    pub(crate) checkpoint_ids: Vec<String>,
 }
 
 /// 工具实际执行后的返回内容。
@@ -389,8 +391,17 @@ impl AgentRuntime {
             dangerous_confirmed: false,
             active_skill_dir: active_skill_dir.clone(),
             verification_policy,
+            checkpoint_ids: Vec::new(),
         };
         if let Err(denied) = self.admit_tool_call(&mut inv, pre_execute_done).await {
+            self.record_rejected_tool_call(&inv, &denied).await;
+            return ToolCallOutput::rejected(denied);
+        }
+        // Checkpoint after admission (policy has approved the call) and before
+        // execution, per work order v7 section 4.6. A snapshot failure stops the
+        // mutation; Moltis's proceed-without-snapshot policy is deliberately not
+        // ported.
+        if let Err(denied) = self.checkpoint_mutation_targets(&mut inv).await {
             self.record_rejected_tool_call(&inv, &denied).await;
             return ToolCallOutput::rejected(denied);
         }
@@ -422,7 +433,20 @@ impl AgentRuntime {
                 }
             }
         }
-        let outcome = self.execute_guarded_tool(&mut inv, ctx, prefetched).await;
+        let mut outcome = self.execute_guarded_tool(&mut inv, ctx, prefetched).await;
+        if !inv.checkpoint_ids.is_empty() {
+            if let Some(object) = outcome.result_json.as_object_mut() {
+                object.insert(
+                    "checkpoint_ids".to_string(),
+                    serde_json::json!(inv.checkpoint_ids),
+                );
+            }
+            outcome.result_str = format!(
+                "{}\n\ncheckpoint_ids: {}",
+                outcome.result_str,
+                inv.checkpoint_ids.join(", ")
+            );
+        }
         let evidence = self
             .tool_registry
             .get(&inv.call.name)
@@ -474,6 +498,47 @@ impl AgentRuntime {
                 AdmissionStage::ExplicitConfirmation => self.guard_explicit_confirmation(inv).await,
             }?;
         }
+        Ok(())
+    }
+
+    /// Snapshot every target the call is about to mutate.
+    ///
+    /// Returns a JSON rejection payload when a snapshot cannot be created. The
+    /// payload is recorded as the tool result, so the model and the audit chain
+    /// see why the mutation did not run.
+    async fn checkpoint_mutation_targets(
+        &mut self,
+        inv: &mut ToolInvocation<'_>,
+    ) -> std::result::Result<(), String> {
+        let targets = super::mutation_checkpoint::MutationCheckpointer::targets_for(
+            &inv.call.name,
+            &inv.args,
+        );
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let resolved: Vec<PathBuf> = targets.iter().map(|path| self.resolve_path(path)).collect();
+        let turn_id = self
+            .current_turn_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let session_key = persist_session_key_for(inv.msg);
+        let action = inv.args.get("action").and_then(|value| value.as_str());
+        let ids = self
+            .mutation_checkpoints
+            .checkpoint_before(&inv.call.name, action, &resolved, &turn_id, &session_key)
+            .await
+            .map_err(|error| {
+                serde_json::json!({
+                    "error": format!("pre-mutation checkpoint failed: {error}"),
+                    "code": "CHECKPOINT_FAILED",
+                    "tool": inv.call.name,
+                    "policy": "mutation_checkpoint",
+                    "hint": "The mutation was not attempted because no durable snapshot could be created. Fix the path or permissions, then retry."
+                })
+                .to_string()
+            })?;
+        inv.checkpoint_ids = ids;
         Ok(())
     }
 

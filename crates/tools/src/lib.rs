@@ -8,6 +8,7 @@ mod bounded_io;
 pub mod browser;
 pub mod camera;
 pub mod chart_generate;
+pub mod checkpoints;
 pub mod code_search;
 pub mod community_hub;
 pub mod context_remaining;

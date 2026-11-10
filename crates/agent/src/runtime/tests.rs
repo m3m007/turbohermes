@@ -12052,3 +12052,67 @@ async fn content_filter_retries_past_two_rejections_and_recovers() {
     assert_eq!(reply, "recovered");
     assert_eq!(provider.0.load(Ordering::SeqCst), 3);
 }
+
+#[tokio::test]
+async fn write_file_takes_a_checkpoint_and_restore_removes_the_created_file() {
+    let mut runtime = test_runtime_with_default_tools();
+    let workspace = runtime.paths.workspace();
+    let path = workspace.join("checkpointed-write.txt");
+    assert!(!path.exists());
+
+    let result = runtime
+        .execute_tool_call(
+            &tool_call(
+                "write_file",
+                serde_json::json!({"path": path.display().to_string(), "content": "after\n"}),
+            ),
+            &test_main_session_inbound("cli", "checkpoint-write"),
+            None,
+        )
+        .await;
+    assert_eq!(result.outcome, ToolOutcome::Succeeded, "{}", result.text);
+    assert!(path.exists());
+    let id = result
+        .text
+        .split("checkpoint_ids: ")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .expect("result carries the checkpoint id")
+        .trim()
+        .to_string();
+    assert_eq!(id.len(), 32, "checkpoint id is 32 hex chars: {id}");
+
+    let restore = runtime
+        .execute_tool_call(
+            &tool_call("checkpoint_restore", serde_json::json!({"id": id})),
+            &test_main_session_inbound("cli", "checkpoint-write"),
+            None,
+        )
+        .await;
+    assert_eq!(restore.outcome, ToolOutcome::Succeeded, "{}", restore.text);
+    assert!(!path.exists(), "restore removes the created file");
+}
+
+#[tokio::test]
+async fn failed_snapshot_blocks_the_mutation() {
+    let mut runtime = test_runtime_with_default_tools();
+    let workspace = runtime.paths.workspace();
+    let path = workspace.join("blocked-write.txt");
+    // Replace the checkpoint root with a regular file so no snapshot can be written.
+    let checkpoint_root = runtime.paths.base.join("checkpoints");
+    std::fs::write(&checkpoint_root, "not a directory").expect("block checkpoint root");
+
+    let result = runtime
+        .execute_tool_call(
+            &tool_call(
+                "write_file",
+                serde_json::json!({"path": path.display().to_string(), "content": "after\n"}),
+            ),
+            &test_main_session_inbound("cli", "checkpoint-blocked"),
+            None,
+        )
+        .await;
+    assert_eq!(result.outcome, ToolOutcome::Rejected, "{}", result.text);
+    assert!(result.text.contains("CHECKPOINT_FAILED"), "{}", result.text);
+    assert!(!path.exists(), "the mutation did not run without a snapshot");
+}
