@@ -547,6 +547,8 @@ mod tests {
             sandbox_policy: None,
             allow_unsandboxed_shell: false,
             approval_policy: None,
+            security_level: None,
+            allowlist: Vec::new(),
         };
         let unrestricted_tool = ExecTool::from_config(&unrestricted_cfg);
         assert_eq!(
@@ -560,6 +562,8 @@ mod tests {
             sandbox_policy: Some("read-only".to_string()),
             allow_unsandboxed_shell: false,
             approval_policy: None,
+            security_level: None,
+            allowlist: Vec::new(),
         };
         let readonly_tool = ExecTool::from_config(&readonly_cfg);
         assert_eq!(
