@@ -52,6 +52,37 @@ impl ApprovalPolicy {
     }
 }
 
+/// Default posture for tool execution, separate from *when* a human is asked.
+///
+/// Ported from Moltis `SecurityLevel` (`crates/tools/src/approval.rs:58-80` at
+/// `8a12400dc10551dfb9a6b568414b91a343ef2d5d`, MIT). Moltis separates "when do I
+/// ask" (`ApprovalMode`, which BlockCell models as [`ApprovalPolicy`]) from
+/// "what is the default posture" (this). Stored as a string so the security
+/// pattern definitions stay in `blockcell-tools`, which cannot depend on this
+/// crate; `blockcell_tools::approval::SecurityLevel::parse` accepts the same
+/// values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SecurityLevel {
+    Deny,
+    #[default]
+    Allowlist,
+    Full,
+}
+
+impl SecurityLevel {
+    pub fn parse(value: Option<&str>) -> crate::Result<Self> {
+        match value.unwrap_or("allowlist") {
+            "allowlist" => Ok(Self::Allowlist),
+            "deny" | "strict" => Ok(Self::Deny),
+            "full" | "permissive" => Ok(Self::Full),
+            other => Err(crate::Error::Validation(format!(
+                "Invalid security_level '{other}'; expected allowlist, deny or full"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecConfig {
@@ -66,6 +97,19 @@ pub struct ExecConfig {
     pub allow_unsandboxed_shell: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_policy: Option<String>,
+    /// Default posture, from Moltis `SecurityLevel`. One of `allowlist`
+    /// (default), `deny` or `full`. `deny` blocks exec outright unless a
+    /// `SecurityLevel`-agnostic allowlist entry matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_level: Option<String>,
+    /// Commands that may skip the approval prompt.
+    ///
+    /// Ported from Moltis `matches_allowlist`
+    /// (`crates/tools/src/approval.rs:453-488`): an entry of `*` matches
+    /// everything, an exact entry matches that binary name, and an entry
+    /// ending in `*` matches that prefix.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowlist: Vec<String>,
 }
 
 impl Default for ExecConfig {
@@ -76,6 +120,8 @@ impl Default for ExecConfig {
             sandbox_policy: None,
             allow_unsandboxed_shell: false,
             approval_policy: None,
+            security_level: None,
+            allowlist: Vec::new(),
         }
     }
 }
@@ -120,7 +166,7 @@ fn default_tick_interval() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApprovalPolicy, ExecConfig};
+    use super::{ApprovalPolicy, ExecConfig, SecurityLevel};
 
     #[test]
     fn approval_policy_parses_supported_values() {
@@ -141,6 +187,48 @@ mod tests {
         let config: ExecConfig =
             serde_json::from_str(r#"{"approvalPolicy":"workspace-auto"}"#).unwrap();
         assert_eq!(config.approval_policy.as_deref(), Some("workspace-auto"));
+    }
+
+    #[test]
+    fn security_level_parses_moltis_aliases() {
+        assert_eq!(SecurityLevel::parse(None).unwrap(), SecurityLevel::Allowlist);
+        assert_eq!(
+            SecurityLevel::parse(Some("deny")).unwrap(),
+            SecurityLevel::Deny
+        );
+        assert_eq!(
+            SecurityLevel::parse(Some("strict")).unwrap(),
+            SecurityLevel::Deny
+        );
+        assert_eq!(
+            SecurityLevel::parse(Some("full")).unwrap(),
+            SecurityLevel::Full
+        );
+        assert_eq!(
+            SecurityLevel::parse(Some("permissive")).unwrap(),
+            SecurityLevel::Full
+        );
+        assert!(SecurityLevel::parse(Some("bogus")).is_err());
+    }
+
+    #[test]
+    fn exec_config_defaults_to_permissive_security_level_and_empty_allowlist() {
+        let config: ExecConfig = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(config.security_level, None);
+        assert!(config.allowlist.is_empty());
+    }
+
+    #[test]
+    fn exec_config_deserializes_security_level_and_allowlist() {
+        let config: ExecConfig = serde_json::from_str(
+            r#"{"securityLevel":"deny","allowlist":["git status","cargo test*"]}"#,
+        )
+        .unwrap();
+        assert_eq!(config.security_level.as_deref(), Some("deny"));
+        assert_eq!(
+            config.allowlist,
+            vec!["git status".to_string(), "cargo test*".to_string()]
+        );
     }
 }
 
