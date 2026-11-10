@@ -211,3 +211,39 @@ Other findings recorded, not fixed:
 than a remote URL, which is why a remote-URL sweep missed it. All seven stripped;
 remotes now hold plain HTTPS URLs and the credential is read from `.env` at push
 time only, verified by a push that left zero token references in config.
+
+## Phase 1 mutation-pipeline audit (2026-11-10, work order v7 section 4.6)
+
+Target: BlockCell `crates/` at pin `5ca38be861b4a3e8f7a1e8d332e242b42ed25710`.
+Reference implementation for the comparison: Moltis at `8a12400dc10551dfb9a6b568414b91a343ef2d5d`.
+
+The four required checks, one row each, in the order the work order lists them.
+
+| # | Work order v7 section 4.6 check | Verdict | Evidence (BlockCell) |
+|---|---|---|---|
+| A | A durable snapshot before **every** mutation | **ABSENT** | Snapshotting exists but is confined to two file stores: `crates/agent/src/skill_file_store.rs` (`snapshot_before_write` -> `snapshot_skill_dir`, lines 506-531) and `crates/agent/src/memory_file_store.rs` (`snapshot_before_write`, lines 397-410). The generic file tools `write_file` and `edit_file` in `crates/tools/src/fs.rs` call `fs.write()` (`crates/tools/src/fs.rs:268`, via `write_file_result` -> `FilesystemBackend::write` in `crates/tools/src/fs_backend.rs:136-141`) with no snapshot at all. `file_ops` (copy/move/delete/compress/decompress, `crates/tools/src/file_ops.rs`) likewise takes no snapshot. `exec`/`shell` mutations are not snapshotted. So "every mutation" is not met. |
+| B | Restore at the level of a **single mutation** | **ABSENT** | Both stores restore only the *latest* snapshot for a target, and the snapshot is the whole target, not the mutation: `SkillFileStore::restore_latest` (`crates/agent/src/skill_file_store.rs:389-469`) and `MemoryFileStore::restore_latest` (`crates/agent/src/memory_file_store.rs:295-329`) both resolve through `latest_snapshot_for`, which picks the newest snapshot directory by name (`skill_file_store.rs:568-591`, `memory_file_store.rs:412-438`). A skill mutation copies the entire skill directory (`snapshot_skill_dir` -> `copy_dir_recursive`), so restoring reverts every auxiliary file in the skill, not the one mutation. There is no per-mutation checkpoint id, no manifest, and no way to address an individual mutation. The snapshot handle is only a filesystem path string (`snapshot_ref`) with no manifest format and no validity checks. |
+| C | A **verification step** | **PRESENT** (partly) | Two distinct mechanisms exist. (1) Post-mutation task verification: `TaskProgress` in `crates/agent/src/runtime/task_progress.rs` tracks `changed` / `uncertain_effects`, requires a recognized check at the current `revision` (`needs_verification`, lines 373-385; `observe`, lines 267-371; `verification_reason`, 387-420), with `TaskContract`/`VerificationPolicy` in `crates/core/src/task_contract.rs` and `ToolEvidence::from_execution_with_policy` (`task_progress.rs:44-106`). (2) Admission-time preconditions: the 8-stage `ADMISSION_STAGES` pipeline in `crates/agent/src/runtime/tool_pipeline.rs` (lines 155-164, `admit_tool_call` at 457-479). What is missing relative to section 4.6 is a *per-mutation* verification that the intended change actually landed: there is no `after_hash` comparison, no postcondition check tied to a single mutation, and no `verification_result` recorded on a mutation record. |
+| D | **Uncertain-outcome handling** | **PRESENT** | `ToolOutcome` in `crates/core/src/failure.rs` (lines 48-61) distinguishes `Succeeded`/`Failed`/`Rejected`/`Cancelled`/`TimedOut`/`NotStarted`/`Unknown`, with `FailureKind::Unknown` (line 28) and `Idempotency` (lines 34-41). The module doc states the rule directly: "Unknown != Failed and Unknown != Retryable: reconcile before any retry." `ToolOutcome::retry_allowed(idempotency)` (lines 95-101) encodes it. At runtime, `unknown_outcome_hint` in `crates/agent/src/runtime/tool_pipeline.rs:232-237` injects the reconcile-first instruction, wired at `run_tool_pipeline` lines 444-449; `FailureKind::classify_tool_error` maps errors with the declared idempotency (`finish_tool_execution`, lines 1344-1377); `TaskProgress::observe` sets `uncertain_effects` on `WorkspaceEffect::Unknown` (line 293-295) which then forces verification. `prefetch.rs:158` refuses to prefetch when the tool is not `Idempotency::Safe`. |
+
+Conclusion for the audit's fourth instruction ("add what is absent by porting from Moltis"):
+items A and B are absent and are the Phase 2 work; C and D are present and are kept.
+
+### What Moltis has that BlockCell does not, and where it lives
+
+Moltis's mutation-safety discipline is two files in `crates/tools/src/` at commit
+`8a12400dc10551dfb9a6b568414b91a343ef2d5d` (MIT):
+
+| Upstream file | What it holds | How it maps onto BlockCell |
+|---|---|---|
+| `crates/tools/src/checkpoints.rs` (631 lines) | `CheckpointRecord` (id, created_at, reason, source_path, source_kind, existed, backup_path), `CheckpointManager` with `checkpoint_path` / `list` / `restore`, a per-turn index `turns.jsonl` with `TurnRecord`, blocking `checkpoint_path_blocking` / `restore_checkpoint_blocking`, `validate_checkpoint_id` (32 hex chars, which rejects path traversal), symlink refusal, `copy_dir_recursive`, manifest write/read, and pruning above 500 checkpoints | The manifest format and the single-mutation restore semantics BlockCell lacks (items A and B). Each checkpoint is one mutation of one path with its own id. |
+| `crates/tools/src/auto_checkpoint.rs` (192 lines) | `AutoCheckpointHook`, a `HookHandler` on `BeforeToolCall` + `AgentEnd`, priority 100 so it runs before the tool modifies the file. `CHECKPOINT_TOOLS = ["Write", "Edit", "MultiEdit"]`, `extract_file_path`, `extract_run_id`, per-session `ActiveTurn` accumulation flushed on `run_id` change and on `AgentEnd` | The hook that makes snapshotting cover *every* mutation instead of two hand-picked stores. BlockCell's equivalent insertion point is the pre-execute stage of `ADMISSION_STAGES` in `crates/agent/src/runtime/tool_pipeline.rs`. |
+
+Moltis also documents the design in `docs/src/checkpoints.md` (the `checkpoints_list`
+and `checkpoint_restore` tools, the `checkpointId` field on checkpointed tool results,
+and the rule that a nonexistent target's restore deletes the later-created path).
+
+**Porting decision recorded now, so Phase 2 does not re-derive it:**
+- From `checkpoints.rs`: port the `CheckpointRecord` manifest schema, `validate_checkpoint_id`, `checkpoint_path_blocking`, `restore_checkpoint_blocking`, `copy_dir_recursive` and the symlink refusal. Keep the logic; change the error type to `blockcell_core::Error`, replace `moltis_agents::tool_registry::AgentTool` with BlockCell's `Tool`, and replace `time::OffsetDateTime` with `chrono::DateTime<Utc>`.
+- From `auto_checkpoint.rs`: port the hook shape, not the tool names. BlockCell's mutating tool set is not `Write`/`Edit`/`MultiEdit`; it is `write_file`, `edit_file`, `file_ops`, `exec`, `shell`, `skill_manage`, and the memory tools. The `BeforeToolCall` equivalent is BlockCell's `AdmissionStage::PreExecute`, which already runs before every guard and already sees listener-rewritten arguments (`run_tool_pipeline`, lines 338-353). Grouping by turn becomes grouping by BlockCell's `current_turn_id` / `trace_id`, which already flows into the audit chain (`audit_tool_call`, lines 572-616).
+- Moltis's failure policy ("do not block the tool call if checkpointing fails", `auto_checkpoint.rs:131-141`) is **not** ported. Work order v7 section 4.6 makes the checkpoint step 4 of 10, before the write, and section 7 makes an unresolvable conflict a stop case. Recorded as a divergence to resolve in Phase 2, not silently adopted.
