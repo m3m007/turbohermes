@@ -17,6 +17,7 @@ The phase contracts live as kanban tickets (t_0e21e9aa through t_86892825),
 linked parent->child so the kanban enforces work order v7's build order. This
 script reads that queue and dispatches. It holds no phase data of its own.
 """
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -84,14 +85,7 @@ def ready_tickets():
                  cwd=KANBAN_DIR)
     if rc != 0:
         return []
-    ids = []
-    for line in out.splitlines():
-        line = line.strip()
-        if line[:1] in ("▶", "⊘"):
-            parts = line.split()
-            if len(parts) > 1 and parts[1].startswith("t_"):
-                ids.append(parts[1])
-    return ids
+    return _ticket_ids(out)
 
 
 def dispatch(ticket_id):
@@ -121,11 +115,111 @@ def dispatch(ticket_id):
     return True
 
 
+def _ticket_ids(out):
+    """Ticket ids from kanban list output, marker-independent.
+
+    The marker changes with the output context: `▶` when stdout is a terminal,
+    `●` when it is captured, and `⊘`/`✓`/`◻` for other states. A parser keyed on
+    the marker silently returns nothing when the context changes, which is how
+    running_tickets() came back empty while a ticket was plainly in `running`.
+    Match the id instead; it is stable.
+    """
+    ids = []
+    for line in out.splitlines():
+        for m in re.findall(r"\b(t_[a-f0-9]{8})\b", line):
+            if m not in ids:
+                ids.append(m)
+    return ids
+
+
+def running_tickets():
+    """Tickets this lane has claimed but not yet completed.
+
+    The defect this closes: dispatch() claims a ticket, which moves it to
+    'running', and nothing ever completed it. A finished phase therefore sat in
+    'running' forever and the next tick re-dispatched work that was already
+    done. The kanban owns the state; this function is how the adapter tells the
+    kanban the build is over.
+    """
+    rc, out = sh("hermes kanban list --assignee %s --status running" % ASSIGNEE,
+                 cwd=KANBAN_DIR)
+    if rc != 0:
+        return []
+    return _ticket_ids(out)
+
+
+# A build that ends on one of these did not succeed, and completing its ticket
+# would record a failure as a delivery. Leave it running and say why.
+FAIL_SIGS = (
+    "451 Unavailable For Legal Reasons",
+    "Error: OpenAI-compatible chat request failed",
+    "Traceback (most recent call last)",
+    "panicked at",
+)
+# A log still being written is not a finished build. 180s of quiet is the bar.
+QUIET_SECONDS = 180
+
+
+def log_evidence(ticket_id):
+    """(result_text, None) if the build can be completed, else (None, reason).
+
+    Evidence comes from the build log and is reported verbatim: token counts,
+    test-binary counts, and the last commit in the worktree. No invention.
+    """
+    logf = LOGDIR / ("jcode-%s.log" % ticket_id)
+    if not logf.exists():
+        return None, "no build log at %s" % logf
+    age = time.time() - logf.stat().st_mtime
+    if age < QUIET_SECONDS:
+        return None, "log still active (%.0fs since last write, need %ds)" % (
+            age, QUIET_SECONDS)
+    text = logf.read_text(errors="replace")
+    tail = text[-8000:]
+    for sig in FAIL_SIGS:
+        if sig in tail:
+            return None, "build log ends on a failure signature: %s" % sig
+    ev = []
+    toks = re.findall(r"\[Tokens\] upload: (\d+)", text)
+    if toks:
+        ev.append("jcode tokens %s" % toks[-1])
+    tests = re.findall(r"test result: ok\. (\d+) passed", text)
+    if tests:
+        ev.append("%d test binaries ok" % len(tests))
+    rc, out = sh("git -C %s log --oneline -1" % (KANBAN_DIR.parent / "turbohermes-wt"),
+                 timeout=30)
+    if rc == 0 and out.strip():
+        ev.append("last worktree commit %s" % out.strip().split()[0])
+    if not ev:
+        return None, "log has no measurable evidence (no tokens, no tests, no commit)"
+    return "Build finished. Evidence from the log: %s." % "; ".join(ev), None
+
+
+def complete_finished():
+    """Close tickets whose build has provably finished. Returns count closed."""
+    closed = 0
+    for tid in running_tickets():
+        result, why = log_evidence(tid)
+        if result is None:
+            log("NOT-COMPLETING %s: %s" % (tid, why))
+            continue
+        rc, out = sh("hermes kanban complete %s --result %s" % (
+            tid, subprocess.list2cmdline([result])), cwd=KANBAN_DIR)
+        if rc == 0:
+            log("COMPLETED %s" % tid)
+            closed += 1
+        else:
+            log("COMPLETE-FAILED %s rc=%d %s" % (tid, rc, out.strip()[:160]))
+    return closed
+
+
 def main():
     alive = jcode_pids()
     if alive:
         log("RUNNING pids=%s" % ",".join(alive))
         return
+    # No build alive: anything this lane claimed is finished or dead. Close what
+    # has evidence, leave the rest with a reason logged.
+    complete_finished()
     tickets = ready_tickets()
     if not tickets:
         log("IDLE no ready %s tickets" % ASSIGNEE)
