@@ -2,6 +2,7 @@ pub mod agent;
 pub mod agent_status;
 pub mod alert_rule;
 pub mod app_control;
+pub mod approval;
 pub mod audio_transcribe;
 pub mod base_packs;
 mod bounded_io;

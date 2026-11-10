@@ -1068,15 +1068,15 @@ mod tests {
     #[tokio::test]
     async fn with_fs_mutation_lock_keeps_map_entry_while_a_waiter_is_queued() {
         let key = "host:/tmp/waiter-keeps-entry".to_string();
-        let (first_in, mut wait_first) = tokio::sync::oneshot::channel::<()>();
-        let (waiter_in, wait_waiter) = tokio::sync::oneshot::channel::<()>();
+        let (first_entered_tx, first_entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
 
         let first = tokio::spawn({
             let key = key.clone();
             async move {
                 with_fs_mutation_lock(key, async move {
-                    let _ = first_in.send(());
-                    let _ = wait_first.await;
+                    let _ = first_entered_tx.send(());
+                    let _ = release_rx.await;
                 })
                 .await;
             }
@@ -1084,16 +1084,13 @@ mod tests {
         let waiter = tokio::spawn({
             let key = key.clone();
             async move {
-                with_fs_mutation_lock(key, async move {
-                    let _ = waiter_in.send(());
-                })
-                .await;
+                with_fs_mutation_lock(key, async {}).await;
             }
         });
-        drop(wait_waiter);
 
-        // Let the waiter reach the gate. It is now queued behind the first
-        // holder, so the entry must still be in the map.
+        // Wait until the first holder is inside, then give the waiter time to
+        // clone its Arc out of the map and queue on the gate.
+        let _ = tokio::time::timeout(Duration::from_secs(2), first_entered_rx).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(
             mutation_queue_map().lock().unwrap().get(&key).is_some(),
@@ -1102,7 +1099,7 @@ mod tests {
 
         // Release the first holder: the waiter takes the same gate, runs, and
         // then the entry is removed again.
-        let _ = wait_first.send(());
+        let _ = release_tx.send(());
         first.await.unwrap();
         waiter.await.unwrap();
         assert!(
@@ -1111,39 +1108,59 @@ mod tests {
         );
     }
 
-    /// End-to-end through the public API: the lock the manager takes really
-    /// does serialize two concurrent checkpoints of the same path.
+    /// End-to-end: `checkpoint_path` takes the same host mutation gate
+    /// `with_fs_mutation_lock` hands out, so a checkpoint of a path whose gate
+    /// is already held waits for the holder instead of racing the copy.
     #[tokio::test]
-    async fn checkpoint_path_serializes_concurrent_snapshots_of_the_same_path() {
+    async fn checkpoint_path_waits_for_the_host_mutation_gate_of_the_same_path() {
         let tmp = tempfile::tempdir().unwrap();
         let manager = CheckpointManager::new(tmp.path().to_path_buf());
         let path = tmp.path().join("shared.txt");
         fs::write(&path, "v0\n").unwrap();
 
-        let first = {
+        // The key the manager derives for this path.
+        let key = checkpoint_mutation_key(&path).await;
+        let (inside_tx, inside_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let holder = tokio::spawn(async move {
+            with_fs_mutation_lock(key, async move {
+                let _ = inside_tx.send(());
+                let _ = release_rx.await;
+            })
+            .await;
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(2), inside_rx).await;
+
+        let mut pending = tokio::spawn({
             let manager = manager.clone();
             let path = path.clone();
-            tokio::spawn(async move {
-                fs::write(&path, "v1\n").unwrap();
-                manager.checkpoint_path(&path, "first").await
-            })
-        };
-        let second = {
-            let manager = manager.clone();
-            let path = path.clone();
-            tokio::spawn(async move {
-                fs::write(&path, "v2\n").unwrap();
-                manager.checkpoint_path(&path, "second").await
-            })
-        };
+            async move { manager.checkpoint_path(&path, "blocked").await }
+        });
 
-        let a = first.await.unwrap().unwrap();
-        let b = second.await.unwrap().unwrap();
+        // While the gate is held, the checkpoint cannot run.
+        let blocked = tokio::time::timeout(Duration::from_millis(100), &mut pending).await;
+        assert!(
+            blocked.is_err(),
+            "checkpoint_path must wait for the host mutation gate of the same path"
+        );
 
-        let contents = [
-            fs::read_to_string(tmp.path().join(&a.id).join("snapshot/file")).unwrap(),
-            fs::read_to_string(tmp.path().join(&b.id).join("snapshot/file")).unwrap(),
-        ];
-        assert_eq!(contents, ["v1\n".to_string(), "v2\n".to_string()]);
+        let _ = release_tx.send(());
+        holder.await.unwrap();
+        let record = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .expect("checkpoint should complete once the gate is released")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(
+                tmp.path()
+                    .join("checkpoints")
+                    .join(&record.id)
+                    .join("snapshot/file")
+            )
+            .unwrap(),
+            "v0\n"
+        );
     }
 }
