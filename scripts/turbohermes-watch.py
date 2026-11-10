@@ -106,8 +106,11 @@ def model_for(ticket_id):
     rc, out = sh("hermes kanban show %s" % ticket_id, cwd=KANBAN_DIR)
     title = ""
     for line in out.splitlines():
-        if "v7 phase:" in line:
-            title = line.split("v7 phase:", 1)[1].strip()
+        # Prefix-independent: tickets are titled "v7 phase: <name>" and
+        # "compress phase: <name>", and keying on one prefix silently sent every
+        # other project's tickets to the fallback model.
+        if "phase:" in line:
+            title = line.split("phase:", 1)[1].strip()
             break
     phase = title.split()[0] if title else ""
     if not phase:
@@ -119,12 +122,18 @@ def model_for(ticket_id):
     lanes = {}
     in_table = False
     for line in POLICY.read_text().splitlines():
-        if "Model lanes" in line:
+        # Read EVERY lane table in the file and merge them, so adding a project
+        # never requires touching this parser. The first version stopped at the
+        # next heading, which meant the compress project's table sat under a `###`
+        # sub-heading and was never read: all four of its phases silently fell
+        # back to the workhorse model.
+        if "Model lanes" in line or line.strip().startswith("| Phase | Role | Model |"):
             in_table = True
             continue
         if in_table:
-            if line.startswith("##"):
-                break
+            if line.startswith("#"):
+                in_table = False
+                continue
             if line.strip().startswith("|") and "---" not in line:
                 cells = [c.strip() for c in line.strip().strip("|").split("|")]
                 if len(cells) >= 3 and cells[0] and cells[0] != "Phase":
@@ -154,8 +163,12 @@ def dispatch(ticket_id):
         "jcode --provider-profile litellm --model %s run "
         "\"Run: hermes kanban show %s --body, read that body, and execute it "
         "exactly. Work order v7 is the authority: reuse before write, and name "
-        "every upstream file you copy or port from. Report only what you ran "
-        "and observed.\""
+        "every upstream file you copy or port from. "
+        "FAN-OUT: this run is a capability test. Where the work splits into "
+        "independent parts, use the swarm tool to run them in parallel rather "
+        "than doing them serially; report which parts you fanned out and which "
+        "you kept serial, and why. "
+        "Report only what you ran and observed.\""
         % (ENV, key, model, ticket_id)
     )
     with open(logf, "a") as lf:
@@ -276,8 +289,13 @@ def main():
     if not tickets:
         log("IDLE no ready %s tickets" % ASSIGNEE)
         return
-    if not dispatch(tickets[0]):
-        log("IDLE dispatch of %s failed" % tickets[0])
+    # Try every ready ticket, not just the first. A ticket that is already
+    # claimed by a live build fails to claim, and giving up there left the next
+    # project's phase waiting behind work that was already running.
+    for tid in tickets:
+        if dispatch(tid):
+            return
+    log("IDLE no ready %s ticket could be claimed" % ASSIGNEE)
 
 
 if __name__ == "__main__":
