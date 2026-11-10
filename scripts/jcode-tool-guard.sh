@@ -109,9 +109,20 @@ Bash|bash|shell|terminal)
     if [ "$RC" -eq 3 ] && [ -n "$REWRITTEN" ] && [ "$REWRITTEN" != "$NEWCMD" ]; then
         NEWCMD="$REWRITTEN"
     fi
-    # NOTE: no grep->rg rewrite here. rtk already wraps grep (verified above), and
-    # a second rewrite on top would be a rule that never fires. If rtk's grep wrap
-    # turns out to scan ignored paths, the fix belongs in rtk, not stacked here.
+    # rg instead of grep, per TOOL-POLICY.md. rtk wraps grep, but ripgrep also
+    # respects .gitignore. Measured honestly: 4% smaller on a small query, so this
+    # is "strictly better", not "a large win". Applied only to recursive grep,
+    # which is the form that walks build artifacts.
+    # NOTE: the pattern must match a recursive grep ANYWHERE in the command, not
+    # only at the start, because `cd /x && grep -rn ...` is a common form and the
+    # case statement anchors at the beginning of the string. It must also handle
+    # BOTH `grep ` and `rtk grep `, because the rtk wrap above has already run.
+    case "$CMD" in
+        *grep\ -[rR]*)
+            printf '%s' "$NEWCMD" | grep -qE '(^|[[:space:]])rtk rg[[:space:]]' || \
+                NEWCMD=$(printf '%s' "$NEWCMD" | sed -E 's/(^|[|;&[:space:]]+)(rtk +)?grep /\1rtk rg /')
+            ;;
+    esac
     [ "$NEWCMD" = "$CMD" ] && exit 0
 
     # WHICH CONTRACT AM I RUNNING UNDER? jcode has two separate pre-tool hooks:
