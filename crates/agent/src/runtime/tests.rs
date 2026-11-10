@@ -12114,5 +12114,8 @@ async fn failed_snapshot_blocks_the_mutation() {
         .await;
     assert_eq!(result.outcome, ToolOutcome::Rejected, "{}", result.text);
     assert!(result.text.contains("CHECKPOINT_FAILED"), "{}", result.text);
-    assert!(!path.exists(), "the mutation did not run without a snapshot");
+    assert!(
+        !path.exists(),
+        "the mutation did not run without a snapshot"
+    );
 }

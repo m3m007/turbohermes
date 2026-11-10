@@ -171,6 +171,8 @@ fn default_intent_router_profiles() -> HashMap<String, IntentToolProfileConfig> 
             core_tools: vec![
                 "read_file".to_string(),
                 "write_file".to_string(),
+                "checkpoints_list".to_string(),
+                "checkpoint_restore".to_string(),
                 "list_dir".to_string(),
                 "exec".to_string(),
                 "web_search".to_string(),

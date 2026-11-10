@@ -2,7 +2,7 @@
 
 Authority: work order v7 section 2.2 (Mutation safety row) and section 9 Phase 1; `agent-daemon/TURBOHERMES-ARCHITECTURE-v2.md` line 395, the transaction protocol (propose, policy check, preconditions, record intent, checkpoint, execute, observe actual state, verify postconditions, commit or restore).
 
-**Read from commit, not the working tree**, which another worker is editing. Every BlockCell line below came from `git show 0e771d5:<path>` (last audit commit, pre-port state). Verified live: `5ca38be861b4a3e8f7a1e8d332e242b42ed25710` is an ancestor of `0e771d5`, and `git diff --numstat 5ca38be..0e771d5 -- <file>` is empty for all twelve audited files, so pin and audit commit hold identical bytes. Repo HEAD is now `6e39fe7` and `crates/tools/src/checkpoints.rs` exists untracked on disk but not in any commit, so the port has started since this audit and is not reflected in these verdicts.
+**Read from commit, not the working tree**, which other workers were editing. Every BlockCell line below came from `git show 0e771d5:<path>` (last audit commit, pre-port state). Verified live: `5ca38be861b4a3e8f7a1e8d332e242b42ed25710` is an ancestor of `0e771d5`, and `git diff --numstat 5ca38be..0e771d5 -- <file>` is empty for all twelve audited files, so pin and audit commit hold identical bytes. The port that followed this audit is described in sections 4 and 5; it does not change the pre-port verdicts in section 2.
 
 ## 1. Scope and pins
 
@@ -45,18 +45,32 @@ Two files in `crates/tools/src/` at `8a12400d`, 823 lines total, both MIT.
 | Upstream file | What it holds | BlockCell insertion point |
 |---|---|---|
 | `checkpoints.rs` (631 lines) | `CheckpointRecord` (36-58: id, created_at, reason, source_path, source_kind, existed, backup_path), `CheckpointManager` (60-118) with `checkpoint_path` (72) and `restore` (108), per-turn `turns.jsonl` index `TurnRecord` (122-), `checkpoint_path_blocking` (341), `restore_checkpoint_blocking` (398-429), `validate_checkpoint_id` (431-440, 32 lowercase hex chars, rejecting path traversal), `copy_dir_recursive` (455) with symlink refusal (461-465, 488-494), manifest write/read, pruning above 500 (`CLEANUP_CHECKPOINT_THRESHOLD`, 24) | The manifest format and single-mutation restore semantics BlockCell lacks (A and B). Each checkpoint is one mutation of one path with its own 32-hex id, so restore is addressable per mutation. |
-| `auto_checkpoint.rs` (192 lines) | `AutoCheckpointHook` (33), a `HookHandler` on `BeforeToolCall` + `AgentEnd` (69), priority 100 so it runs before the tool modifies the file (72-75), `CHECKPOINT_TOOLS = ["Write", "Edit", "MultiEdit"]` (21), `extract_file_path` (48), `extract_run_id` (57), per-session `ActiveTurn` accumulation (24, 36, 154-164) | The hook that makes snapshotting cover every mutation instead of two hand-picked stores. Insert at `AdmissionStage::PreExecute` (`tool_pipeline.rs:157`, `:468`), which already runs before every guard and already sees listener-rewritten arguments (`pre_execute_done`, `tool_pipeline.rs:342-347`). |
+| `auto_checkpoint.rs` (192 lines) | `AutoCheckpointHook` (33), a `HookHandler` on `BeforeToolCall` + `AgentEnd` (69), priority 100 so it runs before the tool modifies the file (72-75), `CHECKPOINT_TOOLS = ["Write", "Edit", "MultiEdit"]` (21), `extract_file_path` (48), `extract_run_id` (57), per-session `ActiveTurn` accumulation (24, 36, 154-164) | The hook that makes snapshotting cover every mutation instead of two hand-picked stores. Insertion point chosen: `checkpoint_mutation_targets` called in `run_tool_pipeline` after `admit_tool_call` returns and before `execute_guarded_tool`, not at `AdmissionStage::PreExecute`. Two reasons: `PreExecute` is skipped when a prefetched call already fired it (`pre_execute_done`), and path-policy approval must run before a snapshot path is resolved. `PreExecute` still sees listener-rewritten arguments, and so does this call. |
 
 `docs/src/checkpoints.md` (75 lines) documents it: `checkpoints_list` (42), `checkpoint_restore` (53), the `checkpointId` field on results (65), per-turn grouping (9-12). Its tool list is wider than the hook's: `create_skill`, `update_skill`, `delete_skill`, `write_skill_files`, `memory_save`, `memory_forget`, `memory_delete` (14-18).
 
-Mapping recorded so Phase 2 does not re-derive it: from `checkpoints.rs` port the `CheckpointRecord` manifest schema, `validate_checkpoint_id`, `checkpoint_path_blocking`, `restore_checkpoint_blocking`, `copy_dir_recursive` and the symlink refusal; keep the logic, change the error type to `blockcell_core::Error`, replace `moltis_agents::tool_registry::AgentTool` with BlockCell's `Tool`, and `time::OffsetDateTime` with `chrono::DateTime<Utc>`. From `auto_checkpoint.rs` port the hook shape, not the tool names: BlockCell's mutating set is `write_file`, `edit_file`, `file_ops`, `exec`, `shell`, `skill_manage` and the memory tools. Grouping by turn becomes grouping by `current_turn_id` / `trace_id`, which already flows into the audit chain (`audit_tool_call`, `tool_pipeline.rs:572-616`, bound at 591).
+Implementation (see section 5 for the files): from `checkpoints.rs` the `CheckpointRecord` manifest schema, `validate_checkpoint_id`, `checkpoint_path_blocking`, `restore_checkpoint_blocking`, `copy_dir_recursive` and the symlink refusal are ported; the error type is `blockcell_core::Error`, `moltis_agents::tool_registry::AgentTool` is BlockCell's `Tool`, and `time::OffsetDateTime` is `chrono::Utc`. From `auto_checkpoint.rs` the hook shape is ported, not the tool names: the snapshot set is `write_file`, `edit_file`, `file_ops` and `office_write`. `exec` and `shell` are excluded because they have no addressable target; `skill_manage` and the memory tools are excluded because their stores already snapshot (`skill_file_store.rs`, `memory_file_store.rs`). Grouping by turn becomes grouping by `current_turn_id`, which already flows into the audit chain (`audit_tool_call`, `tool_pipeline.rs:591`).
 
-**Divergence recorded, not adopted.** `auto_checkpoint.rs:131-141` warns and returns `HookAction::Continue` when checkpointing fails, so the tool proceeds without a snapshot. Work order v7 section 4 makes filesystem snapshots a required element and section 7 makes an unresolvable conflict a stop case, so silently proceeding is not adopted. Phase 2 must choose: block the mutation, or proceed with an explicitly recorded missing-checkpoint state.
+**Divergence decided.** `auto_checkpoint.rs:131-141` warns and returns `HookAction::Continue` when checkpointing fails, so the tool proceeds without a snapshot. Work order v7 section 4 makes filesystem snapshots a required element, so silently proceeding is not adopted. The port blocks: a failed snapshot returns `CHECKPOINT_FAILED` and the mutation does not run. This is the one deliberate behavioural change from upstream, recorded in `mutation_checkpoint.rs`'s module doc.
 
-## 5. Remaining gaps after the planned port
+## 5. The port as implemented, and what remains
 
-The port covers filesystem-path mutations only. These are not covered, and Moltis
-does not provide them either, so porting cannot close them.
+Files: `crates/tools/src/checkpoints.rs` (799 lines, port plus the two tools and
+`restore_within`), `crates/agent/src/runtime/mutation_checkpoint.rs` (272 lines,
+hook shape and target extraction), plus wiring in `crates/agent/src/runtime.rs`,
+`crates/agent/src/runtime/tool_pipeline.rs`, `crates/tools/src/lib.rs`,
+`crates/tools/src/registry.rs` and `crates/core/src/config/intent.rs`. A failed
+snapshot returns `CHECKPOINT_FAILED` and the mutation is rejected.
+
+Verified on this host (commands in `REUSE_MAP.md`, section "Implemented in this run"):
+`cargo test -p blockcell-tools checkpoints` 7 passed; `-p blockcell-agent checkpoint`
+15 passed; `cargo test -p blockcell-tools --test checkpoint_crash_recovery` 2 passed,
+including a child process that aborts after the mutation and a parent that restores
+the pre-crash content from the on-disk manifest; `-p blockcell-core -p blockcell-tools
+-p blockcell-agent` 1816 passed, 9 ignored, 0 failed.
+
+These are not covered, and Moltis does not provide them either, so porting cannot
+close them.
 
 1. **`exec` and `shell` opaque effects.** The checkpoint model snapshots a path
    before it is modified. An `exec` call writes anywhere, spawns processes, hits

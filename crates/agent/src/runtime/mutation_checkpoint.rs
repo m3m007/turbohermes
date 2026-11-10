@@ -246,7 +246,13 @@ mod tests {
 
     #[test]
     fn opaque_and_read_only_tools_have_no_targets() {
-        for tool in ["exec", "shell", "read_file", "list_dir", "checkpoint_restore"] {
+        for tool in [
+            "exec",
+            "shell",
+            "read_file",
+            "list_dir",
+            "checkpoint_restore",
+        ] {
             assert!(
                 MutationCheckpointer::targets_for(tool, &json!({"command": "rm -rf x"})).is_empty(),
                 "{tool} must not be checkpointed"
@@ -256,11 +262,10 @@ mod tests {
 
     #[test]
     fn office_write_info_is_not_a_mutation() {
-        assert!(MutationCheckpointer::targets_for(
-            "office_write",
-            &json!({"action": "info"})
-        )
-        .is_empty());
+        assert!(
+            MutationCheckpointer::targets_for("office_write", &json!({"action": "info"}))
+                .is_empty()
+        );
         assert_eq!(
             MutationCheckpointer::targets_for(
                 "office_write",

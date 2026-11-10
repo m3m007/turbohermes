@@ -247,3 +247,49 @@ and the rule that a nonexistent target's restore deletes the later-created path)
 - From `checkpoints.rs`: port the `CheckpointRecord` manifest schema, `validate_checkpoint_id`, `checkpoint_path_blocking`, `restore_checkpoint_blocking`, `copy_dir_recursive` and the symlink refusal. Keep the logic; change the error type to `blockcell_core::Error`, replace `moltis_agents::tool_registry::AgentTool` with BlockCell's `Tool`, and replace `time::OffsetDateTime` with `chrono::DateTime<Utc>`.
 - From `auto_checkpoint.rs`: port the hook shape, not the tool names. BlockCell's mutating tool set is not `Write`/`Edit`/`MultiEdit`; it is `write_file`, `edit_file`, `file_ops`, `exec`, `shell`, `skill_manage`, and the memory tools. The `BeforeToolCall` equivalent is BlockCell's `AdmissionStage::PreExecute`, which already runs before every guard and already sees listener-rewritten arguments (`run_tool_pipeline`, lines 338-353). Grouping by turn becomes grouping by BlockCell's `current_turn_id` / `trace_id`, which already flows into the audit chain (`audit_tool_call`, lines 572-616).
 - Moltis's failure policy ("do not block the tool call if checkpointing fails", `auto_checkpoint.rs:131-141`) is **not** ported. Work order v7 section 4.6 makes the checkpoint step 4 of 10, before the write, and section 7 makes an unresolvable conflict a stop case. Recorded as a divergence to resolve in Phase 2, not silently adopted.
+
+### Implemented in this run (t_750043a8, 2026-11-10)
+
+The ticket text ("Add what is absent by porting from Moltis") put the port in this
+run rather than deferring it. It overlaps the first half of t_cad97583
+(mutation-safety); the remaining Phase 2 items (approval tiering, path-restriction
+parity) are mapped in `docs/architecture/MOLTIS-APPROVAL-AND-PATHS.md`.
+
+| Requirement | Source (pinned commit) | Action | Target |
+|---|---|---|---|
+| Durable per-mutation snapshot, manifest, single-mutation restore, turn index, pruning, symlink refusal | Moltis `crates/tools/src/checkpoints.rs` @ `8a12400d` (MIT) | port-adapt | `crates/tools/src/checkpoints.rs` (799 lines, 309 lines verbatim upstream) |
+| `checkpoints_list` / `checkpoint_restore` tool surface | Moltis same file | port-adapt | same file, registered in `crates/tools/src/registry.rs` |
+| Restore path restriction (workspace plus approved writable roots) | none (Moltis has no equivalent) | glue | `CheckpointManager::restore_within`, `CheckpointRestoreTool::execute` |
+| Automatic snapshot before file mutations, per-turn grouping | Moltis `crates/tools/src/auto_checkpoint.rs` @ `8a12400d` (MIT) | port-adapt | `crates/agent/src/runtime/mutation_checkpoint.rs` (272 lines), called from `tool_pipeline.rs::checkpoint_mutation_targets` |
+| Default-profile exposure of the two tools | none (BlockCell config) | glue | `crates/core/src/config/intent.rs` `default_intent_router_profiles` |
+
+Adaptations: `Error::message` -> `Error::Tool`; `AgentTool` -> BlockCell `Tool`;
+`OffsetDateTime` -> `chrono::Utc`; `BeforeToolCall`/`AgentEnd` -> a call in
+`run_tool_pipeline` after admission and before `execute_guarded_tool` (PreExecute
+is skipped for prefetched calls and runs before path policy). Snapshot set:
+`write_file`, `edit_file`, `file_ops`, `office_write`. `exec`/`shell` have no
+addressable target; `skill_manage` and the memory tools already snapshot in their
+own stores.
+
+Divergence resolved, not inherited: Moltis proceeds when a checkpoint fails. This
+port blocks with `CHECKPOINT_FAILED` and the mutation does not run, per work order
+v7 section 4 and the architecture transaction protocol.
+
+Evidence, run on this host:
+
+```
+cargo test -p blockcell-tools checkpoints                                  # 7 passed
+cargo test -p blockcell-agent checkpoint                                   # 15 passed
+cargo test -p blockcell-tools --test checkpoint_crash_recovery             # 2 passed
+cargo test -p blockcell-core -p blockcell-tools -p blockcell-agent         # 1816 passed, 9 ignored, 0 failed
+```
+
+`checkpoint_crash_recovery` re-execs its own test binary, checkpoints a file,
+writes a new value and calls `std::process::abort()`. The parent opens a fresh
+`CheckpointManager` over the same directory and restores the pre-crash content.
+That is the work order's Phase 2 acceptance test ("kill the agent after a
+mutation; recovery restores the previous state").
+
+Still absent after the port, and not supplied by Moltis: `exec`/`shell` effects,
+`before_hash`/`after_hash`, per-mutation postcondition, `verification_result`,
+and a snapshot of the restore operation itself.
