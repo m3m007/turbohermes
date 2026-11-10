@@ -14,8 +14,11 @@
 //! through a path restriction that upstream does not have.
 
 use std::{
+    collections::HashMap,
     fs,
+    future::Future,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use {
@@ -35,6 +38,121 @@ const MAX_LIST_LIMIT: usize = 100;
 const CLEANUP_CHECKPOINT_THRESHOLD: usize = 500;
 /// Fraction of checkpoints to remove when pruning.
 const CLEANUP_PRUNE_RATIO: f64 = 0.2;
+
+// ── Mutation serialization ───────────────────────────────────────────────────
+//
+// Ported from Moltis `crates/tools/src/fs/shared.rs` (commit
+// 8a12400dc10551dfb9a6b568414b91a343ef2d5d, MIT), lines 36-90. Upstream keeps
+// the map in the fs module; checkpoints.rs is its own module here, so the
+// functions are copied verbatim apart from the `blockcell_core::{Error, Result}`
+// import that this file already uses.
+
+/// Global map from mutation queue key to the gate serializing that key.
+type MutationQueueMap = Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+
+/// Process-wide registry of per-path mutation gates.
+///
+/// The `Arc` is cloned out under the map lock and the map lock is released
+/// immediately, so no blocking work happens while holding it. Entries are
+/// dropped again when the last holder leaves (see the refcount check in
+/// [`with_fs_mutation_lock`]), which keeps the map from growing without bound
+/// over the life of the process.
+fn mutation_queue_map() -> &'static MutationQueueMap {
+    static QUEUES: OnceLock<MutationQueueMap> = OnceLock::new();
+    QUEUES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Serialize filesystem mutations that target the same logical path.
+///
+/// Host mutations should use a canonical absolute path as the key. Sandbox
+/// mutations should include the session key in the namespace so two isolated
+/// sandboxes writing the same in-container path do not block each other.
+///
+/// Ported verbatim from upstream `with_fs_mutation_lock` (shared.rs:46-73),
+/// including the order that matters: clone the `Arc` out of the map, drop the
+/// map lock, take the gate, run the op, drop the guard, then re-lock the map.
+/// The final check keeps the entry only while a waiter is queued, using
+/// `Arc::strong_count == 2` to mean "map holds one, this call holds the other,
+/// nobody else is waiting".
+pub async fn with_fs_mutation_lock<T, F>(key: String, op: F) -> T
+where
+    F: Future<Output = T>,
+{
+    let gate = {
+        let mut queues = mutation_queue_map()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        queues
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+
+    let guard = gate.lock().await;
+    let result = op.await;
+    drop(guard);
+
+    let mut queues = mutation_queue_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let should_remove = queues
+        .get(&key)
+        .is_some_and(|current| Arc::ptr_eq(current, &gate) && Arc::strong_count(current) == 2);
+    if should_remove {
+        queues.remove(&key);
+    }
+
+    result
+}
+
+/// Key for host-side filesystem mutation serialization.
+#[must_use]
+pub fn host_mutation_queue_key(path: &Path) -> String {
+    format!("host:{}", path.display())
+}
+
+/// Key for sandbox-side filesystem mutation serialization.
+#[must_use]
+pub fn sandbox_mutation_queue_key(session_key: &str, file_path: &str) -> String {
+    format!("sandbox:{session_key}:{file_path}")
+}
+
+/// Resolve a source path for checkpoint mutation serialization.
+///
+/// Canonicalization is what makes two references to the same file share a gate:
+/// `a/../b.txt` and `/data/b.txt` collapse onto one key. The path may not exist
+/// yet (a checkpoint of an absent path records `existed: false` and restores by
+/// deletion), so a failed canonicalization falls back to the canonicalized
+/// parent plus the file name, and then to the path as given. Upstream has the
+/// equivalent helpers `canonicalize_existing` (shared.rs:635) and
+/// `canonicalize_for_create` (shared.rs:647); neither fits a path that may be
+/// absent, so this combines their behaviour.
+///
+/// Async so the canonicalization never parks a runtime worker thread.
+async fn checkpoint_mutation_key(source: &Path) -> String {
+    if let Ok(canonical) = tokio::fs::canonicalize(source).await {
+        return host_mutation_queue_key(&canonical);
+    }
+    // This crate is on edition 2021, so the same condition is spelled out with
+    // nested ifs rather than the let-chain upstream uses.
+    if let Some(parent) = source.parent() {
+        if let Some(name) = source.file_name() {
+            if let Ok(canonical_parent) = tokio::fs::canonicalize(parent).await {
+                return host_mutation_queue_key(&canonical_parent.join(name));
+            }
+        }
+    }
+    host_mutation_queue_key(source)
+}
+
+/// Read a checkpoint manifest without parking a runtime worker thread.
+///
+/// The manifest names the source path, and the source path is the mutation
+/// queue key, so a restore has to read it before it can take the lock.
+async fn read_manifest_async(checkpoint_dir: &Path) -> Result<CheckpointRecord> {
+    let payload = tokio::fs::read(checkpoint_dir.join("manifest.json")).await?;
+    Ok(serde_json::from_slice(&payload)?)
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -80,14 +198,27 @@ impl CheckpointManager {
         }
     }
 
+    /// Snapshot the current contents of `source` into a fresh checkpoint
+    /// directory.
+    ///
+    /// The copy runs under the host mutation gate for `source`'s canonical path,
+    /// so a concurrent restore or a second checkpoint of the same file cannot
+    /// interleave with the copy and produce a snapshot that never existed on
+    /// disk. Ported from Moltis `crates/tools/src/fs/shared.rs:46`.
     pub async fn checkpoint_path(&self, source: &Path, reason: &str) -> Result<CheckpointRecord> {
         let base_dir = self.base_dir.clone();
         let source = source.to_path_buf();
         let reason = reason.to_string();
 
-        tokio::task::spawn_blocking(move || checkpoint_path_blocking(&base_dir, &source, &reason))
-            .await
-            .map_err(|error| Error::Tool(format!("checkpoint task failed: {error}")))?
+        // The key is resolved before the lock is taken, and the blocking body
+        // runs on `spawn_blocking` inside it, so nothing parks a runtime worker.
+        let key = checkpoint_mutation_key(&source).await;
+        with_fs_mutation_lock(key, async move {
+            tokio::task::spawn_blocking(move || checkpoint_path_blocking(&base_dir, &source, &reason))
+                .await
+                .map_err(|error| Error::Tool(format!("checkpoint task failed: {error}")))?
+        })
+        .await
     }
 
     pub async fn list(
@@ -116,13 +247,27 @@ impl CheckpointManager {
         .map_err(|error| Error::Tool(format!("checkpoint list task failed: {error}")))?
     }
 
+    /// Write a checkpoint's snapshot back over its source path.
+    ///
+    /// The key is the source path the manifest names, so a restore of a path is
+    /// serialized against a concurrent checkpoint of the same path. Ported from
+    /// Moltis `crates/tools/src/fs/shared.rs:46`.
     pub async fn restore(&self, id: &str) -> Result<CheckpointRecord> {
+        validate_checkpoint_id(id)?;
         let base_dir = self.base_dir.clone();
-        let id = id.to_string();
+        let id_owned = id.to_string();
 
-        tokio::task::spawn_blocking(move || restore_checkpoint_blocking(&base_dir, &id))
-            .await
-            .map_err(|error| Error::Tool(format!("checkpoint restore task failed: {error}")))?
+        // The manifest names the source path, and the source path is the
+        // mutation key, so the manifest is read before the lock is taken.
+        let record = read_manifest_async(&base_dir.join(&id_owned)).await?;
+        let key = checkpoint_mutation_key(Path::new(&record.source_path)).await;
+
+        with_fs_mutation_lock(key, async move {
+            tokio::task::spawn_blocking(move || restore_checkpoint_blocking(&base_dir, &id_owned))
+                .await
+                .map_err(|error| Error::Tool(format!("checkpoint restore task failed: {error}")))?
+        })
+        .await
     }
 
     /// Restore a checkpoint, but only when the checkpointed source path is
@@ -141,28 +286,40 @@ impl CheckpointManager {
         let id_owned = id.to_string();
         let roots = allowed_roots.to_vec();
 
-        tokio::task::spawn_blocking(move || {
-            let checkpoint_dir = base_dir.join(&id_owned);
-            let record = read_manifest(&checkpoint_dir)?;
-            let source = PathBuf::from(&record.source_path);
-            let canonical_source = source.canonicalize().unwrap_or(source.clone());
+        // Same key as `restore`: the manifest names the source path, and the
+        // source path is the mutation key, so the write-back is serialized
+        // against a concurrent checkpoint of the same path. The manifest is
+        // read twice, as before: once here for the key, once inside the
+        // closure that also runs the root check (which upstream ordering
+        // keeps, so a rejected restore still holds the gate).
+        let record = read_manifest_async(&base_dir.join(&id_owned)).await?;
+        let key = checkpoint_mutation_key(Path::new(&record.source_path)).await;
 
-            let allowed = roots.iter().any(|root| {
-                let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
-                canonical_source == canonical_root || canonical_source.starts_with(&canonical_root)
-            });
-            if !allowed {
-                return Err(Error::Tool(format!(
-                    "refusing to restore checkpoint '{}': source path '{}' is outside the allowed roots",
-                    id_owned,
-                    record.source_path
-                )));
-            }
+        with_fs_mutation_lock(key, async move {
+            tokio::task::spawn_blocking(move || {
+                let checkpoint_dir = base_dir.join(&id_owned);
+                let record = read_manifest(&checkpoint_dir)?;
+                let source = PathBuf::from(&record.source_path);
+                let canonical_source = source.canonicalize().unwrap_or(source.clone());
 
-            restore_checkpoint_blocking(&base_dir, &id_owned)
+                let allowed = roots.iter().any(|root| {
+                    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+                    canonical_source == canonical_root || canonical_source.starts_with(&canonical_root)
+                });
+                if !allowed {
+                    return Err(Error::Tool(format!(
+                        "refusing to restore checkpoint '{}': source path '{}' is outside the allowed roots",
+                        id_owned,
+                        record.source_path
+                    )));
+                }
+
+                restore_checkpoint_blocking(&base_dir, &id_owned)
+            })
+            .await
+            .map_err(|error| Error::Tool(format!("checkpoint restore task failed: {error}")))?
         })
         .await
-        .map_err(|error| Error::Tool(format!("checkpoint restore task failed: {error}")))?
     }
 }
 
@@ -670,6 +827,7 @@ fn u64_param(params: &Value, key: &str, default: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn checkpoint_round_trip_restores_file_content() {
@@ -795,5 +953,197 @@ mod tests {
         assert!(error.to_string().contains("outside the allowed roots"));
         // The source file was not touched.
         assert_eq!(fs::read_to_string(&target).unwrap(), "keep\n");
+    }
+
+    /// N holders of the same key must run one after another, never interleaved.
+    ///
+    /// Matches the structure of upstream `mutation_lock_serializes_same_key`
+    /// (shared.rs:958-989): each holder sleeps while it "mutates", records its
+    /// index, and the recorded order has to be 0,1,2,...
+    #[tokio::test]
+    async fn with_fs_mutation_lock_serializes_same_key() {
+        let holders = 5;
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        let mut tasks = Vec::new();
+        for index in 0..holders {
+            let order = Arc::clone(&order);
+            tasks.push(tokio::spawn(async move {
+                with_fs_mutation_lock("host:/tmp/serialize".to_string(), async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    order.lock().unwrap().push(index);
+                })
+                .await;
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            (0..holders).collect::<Vec<_>>(),
+            "holders of the same key must run strictly in acquisition order"
+        );
+    }
+
+    /// Two different keys must not block each other.
+    ///
+    /// The semaphore starts with zero permits: both holders have to be inside
+    /// the critical section at the same time for `try_acquire_many(2)` to
+    /// succeed, which is only possible if the second key's holder entered while
+    /// the first key was still held.
+    #[tokio::test]
+    async fn with_fs_mutation_lock_distinct_keys_run_concurrently() {
+        let both_inside = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let first = {
+            let both_inside = Arc::clone(&both_inside);
+            tokio::spawn(async move {
+                with_fs_mutation_lock("host:/tmp/alpha".to_string(), async move {
+                    both_inside.add_permits(1);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                })
+                .await;
+            })
+        };
+
+        let second = {
+            let both_inside = Arc::clone(&both_inside);
+            tokio::spawn(async move {
+                with_fs_mutation_lock("host:/tmp/beta".to_string(), async move {
+                    both_inside.add_permits(1);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                })
+                .await;
+            })
+        };
+
+        let overlap = tokio::time::timeout(Duration::from_secs(2), both_inside.acquire_many(2)).await;
+        assert!(
+            overlap.is_ok(),
+            "distinct keys must not block each other"
+        );
+
+        first.await.unwrap();
+        second.await.unwrap();
+    }
+
+    /// Host and sandbox keys live in different namespaces, and the sandbox key
+    /// carries the session key so two isolated sandboxes never share a gate.
+    #[test]
+    fn mutation_queue_keys_are_namespaced() {
+        let host = host_mutation_queue_key(Path::new("/data/file.txt"));
+        let sandbox = sandbox_mutation_queue_key("session:abc", "/data/file.txt");
+
+        assert_ne!(host, sandbox, "host and sandbox keys must differ");
+        assert!(host.starts_with("host:"));
+        assert!(sandbox.starts_with("sandbox:"));
+        assert!(sandbox.contains("session:abc"), "sandbox key must carry the session key");
+
+        let other_session = sandbox_mutation_queue_key("session:xyz", "/data/file.txt");
+        assert_ne!(sandbox, other_session, "different sessions must not share a gate");
+    }
+
+    /// The refcount cleanup: once the last holder releases, the map entry is
+    /// gone, so the map cannot grow without bound over the life of the process.
+    #[tokio::test]
+    async fn with_fs_mutation_lock_removes_map_entry_after_last_release() {
+        let key = "host:/tmp/reclaimed".to_string();
+        assert!(
+            mutation_queue_map().lock().unwrap().get(&key).is_none(),
+            "key must start absent"
+        );
+
+        with_fs_mutation_lock(key.clone(), async {}).await;
+
+        assert!(
+            mutation_queue_map().lock().unwrap().get(&key).is_none(),
+            "map entry must be removed after the last holder releases"
+        );
+    }
+
+    /// A waiter queued behind a live holder keeps the map entry, so the waiter
+    /// reuses the same gate instead of racing past the first holder.
+    #[tokio::test]
+    async fn with_fs_mutation_lock_keeps_map_entry_while_a_waiter_is_queued() {
+        let key = "host:/tmp/waiter-keeps-entry".to_string();
+        let (first_in, mut wait_first) = tokio::sync::oneshot::channel::<()>();
+        let (waiter_in, wait_waiter) = tokio::sync::oneshot::channel::<()>();
+
+        let first = tokio::spawn({
+            let key = key.clone();
+            async move {
+                with_fs_mutation_lock(key, async move {
+                    let _ = first_in.send(());
+                    let _ = wait_first.await;
+                })
+                .await;
+            }
+        });
+        let waiter = tokio::spawn({
+            let key = key.clone();
+            async move {
+                with_fs_mutation_lock(key, async move {
+                    let _ = waiter_in.send(());
+                })
+                .await;
+            }
+        });
+        drop(wait_waiter);
+
+        // Let the waiter reach the gate. It is now queued behind the first
+        // holder, so the entry must still be in the map.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            mutation_queue_map().lock().unwrap().get(&key).is_some(),
+            "map entry must survive while a waiter is queued"
+        );
+
+        // Release the first holder: the waiter takes the same gate, runs, and
+        // then the entry is removed again.
+        let _ = wait_first.send(());
+        first.await.unwrap();
+        waiter.await.unwrap();
+        assert!(
+            mutation_queue_map().lock().unwrap().get(&key).is_none(),
+            "map entry must be removed after the last waiter releases"
+        );
+    }
+
+    /// End-to-end through the public API: the lock the manager takes really
+    /// does serialize two concurrent checkpoints of the same path.
+    #[tokio::test]
+    async fn checkpoint_path_serializes_concurrent_snapshots_of_the_same_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = CheckpointManager::new(tmp.path().to_path_buf());
+        let path = tmp.path().join("shared.txt");
+        fs::write(&path, "v0\n").unwrap();
+
+        let first = {
+            let manager = manager.clone();
+            let path = path.clone();
+            tokio::spawn(async move {
+                fs::write(&path, "v1\n").unwrap();
+                manager.checkpoint_path(&path, "first").await
+            })
+        };
+        let second = {
+            let manager = manager.clone();
+            let path = path.clone();
+            tokio::spawn(async move {
+                fs::write(&path, "v2\n").unwrap();
+                manager.checkpoint_path(&path, "second").await
+            })
+        };
+
+        let a = first.await.unwrap().unwrap();
+        let b = second.await.unwrap().unwrap();
+
+        let contents = [
+            fs::read_to_string(tmp.path().join(&a.id).join("snapshot/file")).unwrap(),
+            fs::read_to_string(tmp.path().join(&b.id).join("snapshot/file")).unwrap(),
+        ];
+        assert_eq!(contents, ["v1\n".to_string(), "v2\n".to_string()]);
     }
 }

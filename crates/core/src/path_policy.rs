@@ -11,6 +11,10 @@ fn format_policy_parse_error(policy_file: &Path, error: &json5::Error) -> String
 }
 
 /// Which operation is being performed on a path.
+///
+/// [`PathOp::List`] is also the directory-walk op (Glob / Grep): a walk root is
+/// gated by [`PathPolicy::evaluate_deny_only`] and its results are then filtered
+/// per entry with [`PathPolicy::evaluate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PathOp {
@@ -87,6 +91,19 @@ pub struct PathPolicyFileConfig {
     /// User-defined rules, evaluated in priority order (deny > allow > confirm).
     #[serde(default)]
     pub rules: Vec<PathRule>,
+
+    /// When `true`, a path whose **final component** is a symbolic link is
+    /// denied outright instead of being canonicalized and evaluated at its
+    /// target. Defaults to `false` so existing deployments keep today's
+    /// canonicalizing behaviour.
+    ///
+    /// Ported from upstream `reject_if_symlink`
+    /// (`moltis/crates/tools/src/fs/shared.rs:669`), which stats the
+    /// *original* user-supplied path rather than the canonical one: a
+    /// canonicalized path can never itself be a symlink, so checking it would
+    /// be a no-op.
+    #[serde(default)]
+    pub reject_symlinks: bool,
 }
 
 fn default_version() -> u32 {
@@ -102,9 +119,44 @@ impl Default for PathPolicyFileConfig {
             default_policy: PolicyAction::Confirm,
             cache_confirmed_dirs: true,
             builtin_protected_paths: true,
+            reject_symlinks: false,
             rules: Vec::new(),
         }
     }
+}
+
+/// Validate the path globs of a [`PathPolicyFileConfig`], returning one warning
+/// string per suspicious entry. Never returns an error, so a config that would
+/// have loaded before still loads.
+///
+/// Ported from upstream `moltis/crates/config/src/validate/semantic.rs:285-309`,
+/// which *warns* on `allow_paths` / `deny_paths` entries that are neither
+/// absolute nor `**` globs, while a relative `workspace_root` (line 273) is a
+/// hard error. The warning-only shape is kept here because a rejected config
+/// would fall back to safe defaults, which is a bigger behaviour change than
+/// the typo it is guarding against.
+///
+/// Divergences from upstream: upstream has no tilde expansion, so a `~/...`
+/// entry warns there; here `~` and `~/...` are first-class prefixes handled by
+/// [`expand_tilde`] and are therefore valid.
+pub fn validate_path_rules(config: &PathPolicyFileConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (rule_idx, rule) in config.rules.iter().enumerate() {
+        for (path_idx, entry) in rule.paths.iter().enumerate() {
+            let acceptable = Path::new(entry).is_absolute()
+                || entry == "~"
+                || entry.starts_with("~/")
+                || entry.starts_with("**");
+            if !acceptable {
+                warnings.push(format!(
+                    "rules[{rule_idx}] ('{}').paths[{path_idx}] = '{entry}' is not an absolute path, \
+                     a '~' prefixed path, or a '**' glob — it will never match a resolved path",
+                    rule.name
+                ));
+            }
+        }
+    }
+    warnings
 }
 
 /// Built-in protected path prefixes used when `builtin_protected_paths = true`
@@ -203,6 +255,9 @@ impl PathPolicy {
                         rules = config.rules.len(),
                         "Loaded path access policy"
                     );
+                    for warning in validate_path_rules(&config) {
+                        warn!(path = %policy_file.display(), "{warning}");
+                    }
                     Self {
                         config,
                         from_file: true,
@@ -247,7 +302,20 @@ impl PathPolicy {
     ///    — an `allow` rule that is MORE specific than a `deny` rule wins
     /// 4. User `confirm` rules
     /// 5. `default_policy`
+    ///
+    /// When [`PathPolicyFileConfig::reject_symlinks`] is `true`, step 0 refuses
+    /// any path that is itself a symbolic link. That step stats the path exactly
+    /// as it was handed in — never a canonicalized copy of it — because
+    /// canonicalization resolves symlinks away, so checking the canonical path
+    /// would always answer "not a symlink" and implement a no-op. Callers that
+    /// hold a canonical path must therefore keep the original alongside it and
+    /// run this check against the original; see [`PathPolicy::reject_symlink`].
     pub fn evaluate(&self, resolved: &Path, op: PathOp) -> PolicyAction {
+        // 0. Symlink refusal (opt-in, off by default).
+        if self.config.reject_symlinks && Self::reject_symlink(resolved) {
+            return PolicyAction::Deny;
+        }
+
         // 1. Built-in sensitive paths
         if self.config.builtin_protected_paths {
             for secret in builtin_secret_paths() {
@@ -298,6 +366,73 @@ impl PathPolicy {
 
         // 5. Default
         self.config.default_policy
+    }
+
+    /// Whether a path is itself a symbolic link.
+    ///
+    /// Sync port of upstream `reject_if_symlink`
+    /// (`moltis/crates/tools/src/fs/shared.rs:669`), which is async and takes
+    /// the **original** user-supplied `&str`. The upstream doc comment states the
+    /// reason for that choice: `canonicalize_existing` (same file, line 635) has
+    /// already resolved symlinks, so the canonical path is never a symlink and
+    /// checking it would be a no-op. Same reasoning is preserved here.
+    ///
+    /// Upstream turns a failed `stat` into an error; this returns `false`
+    /// instead, because a path that cannot be stat'd at all (typically because
+    /// it does not exist yet, as in a write to a new file) is not a symlink and
+    /// must not be denied by a check that only exists to refuse links.
+    pub fn reject_symlink(path: &Path) -> bool {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) => meta.file_type().is_symlink(),
+            Err(_) => false,
+        }
+    }
+
+    /// Deny-only check used to gate a directory-walk root (Glob / Grep / List).
+    ///
+    /// Returns `true` when the path is denied and the whole call should be
+    /// rejected, `false` when the walk may proceed and be filtered per entry.
+    ///
+    /// Ported from upstream `check_deny_only`
+    /// (`moltis/crates/tools/src/fs/shared.rs:384`) together with
+    /// `enforce_path_policy_deny_only` (same file, line 427) and
+    /// `path_denied_payload` (line 432, keys `kind` / `file_path` / `error` /
+    /// `detail`). Upstream keeps two `GlobSet`s and this variant consults only
+    /// the deny one: a walk root normally does not match a file-granular allow
+    /// list even though its children do, so the allow list has to filter
+    /// results rather than gate the call. Deny-list matches still reject the
+    /// entire call, and per-entry filtering continues to apply the full
+    /// [`PathPolicy::evaluate`].
+    ///
+    /// The deny list here is: the built-in secret paths when
+    /// [`PathPolicyFileConfig::builtin_protected_paths`] is on (same
+    /// short-circuit [`PathPolicy::evaluate`] performs), plus every user rule
+    /// with `action: "deny"` whose `ops` cover `op`. In `path_access.json5`
+    /// that means a `deny` rule whose `ops` include the walk op (`"list"` for
+    /// Glob / Grep / `list_dir`) *is* the deny-only list — no separate config
+    /// key exists or is needed for it.
+    ///
+    /// Divergences from [`PathPolicy::evaluate`], both deliberate:
+    ///
+    /// * A more specific user `allow` rule does **not** override a matching deny
+    ///   rule here. Upstream `check_deny_only` is a pure deny test for the same
+    ///   reason. An operator who wants `~/dev` walked out from under a broader
+    ///   `deny` on `~` should scope that deny rule's `paths` or `ops` instead.
+    /// * Built-in *system* paths (`/etc`, `/usr/bin`, …) are not part of this
+    ///   check. They are conditional — denied for `Write` only when no more
+    ///   specific `allow` rule exists — so folding them in would reject a walk
+    ///   root wholesale while the per-entry policy would have allowed most of
+    ///   it, which is exactly what the deny-only variant exists to avoid.
+    pub fn evaluate_deny_only(&self, resolved: &Path, op: PathOp) -> bool {
+        if self.config.builtin_protected_paths {
+            for secret in builtin_secret_paths() {
+                if path_starts_with_normalized(resolved, &expand_tilde(secret)) {
+                    return true;
+                }
+            }
+        }
+        self.best_match_len(resolved, op, PolicyAction::Deny)
+            .is_some()
     }
 
     /// Paths explicitly allowed for writes, resolved for use as sandbox roots.
@@ -524,6 +659,26 @@ mod tests {
                 default_policy: default,
                 cache_confirmed_dirs: true,
                 builtin_protected_paths: false, // disable built-ins so unit tests are deterministic
+                reject_symlinks: false,
+                rules,
+            },
+            from_file: false,
+        }
+    }
+
+    /// Same as [`make_policy`] but with `reject_symlinks` enabled.
+    fn make_policy_reject_symlinks(
+        rules: Vec<PathRule>,
+        default: PolicyAction,
+        reject_symlinks: bool,
+    ) -> PathPolicy {
+        PathPolicy {
+            config: PathPolicyFileConfig {
+                version: 1,
+                default_policy: default,
+                cache_confirmed_dirs: true,
+                builtin_protected_paths: false,
+                reject_symlinks,
                 rules,
             },
             from_file: false,
@@ -784,5 +939,255 @@ mod tests {
         assert_eq!(policy.evaluate(&target, PathOp::Write), PolicyAction::Allow);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── evaluate_deny_only (upstream shared.rs:384 / 427 / 432) ──────────────
+
+    /// Build a policy with an `allow` root and a `deny` subtree under it, both
+    /// written against canonical paths so the test works on macOS too (where
+    /// `/tmp` is itself a symlink to `/private/tmp`).
+    fn deny_only_policy() -> (PathPolicy, PathBuf, PathBuf) {
+        let root = unique_temp_dir("deny_only");
+        let allowed = root.join("allowed");
+        let secret = root.join("secret");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        let canon = |p: &Path| {
+            std::fs::canonicalize(p)
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        };
+        let policy = make_policy(
+            vec![
+                PathRule {
+                    name: "allow-root".to_string(),
+                    action: PolicyAction::Allow,
+                    ops: vec![PathOp::Read, PathOp::List],
+                    paths: vec![canon(&root)],
+                },
+                PathRule {
+                    name: "deny-secret".to_string(),
+                    action: PolicyAction::Deny,
+                    ops: vec![PathOp::Read, PathOp::List],
+                    paths: vec![canon(&secret)],
+                },
+            ],
+            PolicyAction::Confirm,
+        );
+        (policy, root.join("allowed"), root.join("secret"))
+    }
+
+    #[test]
+    fn test_evaluate_deny_only_gates_walk_root_only() {
+        let (policy, allowed, secret) = deny_only_policy();
+
+        // The walk root itself is allowed through — the deny list must not
+        // reject the whole call.
+        assert!(!policy.evaluate_deny_only(&allowed, PathOp::List));
+        // ...but a denied child inside that same root is.
+        assert!(policy.evaluate_deny_only(&secret, PathOp::List));
+        assert!(policy.evaluate_deny_only(&secret.join("id_rsa"), PathOp::List));
+        // An allowed sibling under the walk root is not.
+        assert!(!policy.evaluate_deny_only(&allowed.join("main.rs"), PathOp::List));
+
+        // Per-entry filtering still applies the full policy: the deny rule wins
+        // inside the denied subtree, the allow rule wins elsewhere.
+        assert_eq!(
+            policy.evaluate(&secret.join("id_rsa"), PathOp::List),
+            PolicyAction::Deny
+        );
+        assert_eq!(
+            policy.evaluate(&allowed.join("main.rs"), PathOp::List),
+            PolicyAction::Allow
+        );
+    }
+
+    #[test]
+    fn test_evaluate_deny_only_false_without_deny_rules() {
+        let root = unique_temp_dir("deny_only_none");
+        std::fs::create_dir_all(&root).unwrap();
+        let canon = root.canonicalize().unwrap();
+
+        // Allow-only rules: nothing is ever denied, so every walk root passes.
+        let allow_only = make_policy(
+            vec![PathRule {
+                name: "allow-all".to_string(),
+                action: PolicyAction::Allow,
+                ops: vec![PathOp::Read, PathOp::List, PathOp::Write],
+                paths: vec![canon.to_string_lossy().to_string()],
+            }],
+            PolicyAction::Deny,
+        );
+        assert!(!allow_only.evaluate_deny_only(&canon, PathOp::List));
+        assert!(!allow_only.evaluate_deny_only(&canon.join("a.rs"), PathOp::List));
+
+        // No rules at all: same answer, even though the default policy denies.
+        let empty = make_policy(vec![], PolicyAction::Deny);
+        assert!(!empty.evaluate_deny_only(&canon, PathOp::List));
+        assert!(!empty.evaluate_deny_only(&canon.join("a.rs"), PathOp::List));
+        assert!(!empty.evaluate_deny_only(&canon.join("a.rs"), PathOp::Read));
+        assert!(!empty.evaluate_deny_only(&canon.join("a.rs"), PathOp::Write));
+
+        // A confirm rule is not a deny rule.
+        let confirm = make_policy(
+            vec![PathRule {
+                name: "confirm-all".to_string(),
+                action: PolicyAction::Confirm,
+                ops: vec![PathOp::List],
+                paths: vec![canon.to_string_lossy().to_string()],
+            }],
+            PolicyAction::Deny,
+        );
+        assert!(!confirm.evaluate_deny_only(&canon, PathOp::List));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_evaluate_deny_only_respects_ops() {
+        // A deny rule scoped to `write` only must not gate a read/list walk.
+        let root = unique_temp_dir("deny_only_ops");
+        std::fs::create_dir_all(&root).unwrap();
+        let canon = root.canonicalize().unwrap();
+        let policy = make_policy(
+            vec![PathRule {
+                name: "deny-write".to_string(),
+                action: PolicyAction::Deny,
+                ops: vec![PathOp::Write],
+                paths: vec![canon.to_string_lossy().to_string()],
+            }],
+            PolicyAction::Allow,
+        );
+        assert!(!policy.evaluate_deny_only(&canon, PathOp::List));
+        assert!(!policy.evaluate_deny_only(&canon, PathOp::Read));
+        // exec 兼具读写：deny-write 仍然拦截 exec 提取出的路径（与 evaluate 一致）。
+        assert!(policy.evaluate_deny_only(&canon, PathOp::Exec));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── reject_symlinks (upstream shared.rs:669) ─────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn test_reject_symlinks_flag_gates_symlinked_path() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir("reject_symlinks");
+        let allowed = root.join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let link = root.join("link");
+        symlink(&allowed, &link).unwrap();
+        let canon_allowed = std::fs::canonicalize(&allowed).unwrap();
+
+        let rules = |name: &str| {
+            vec![PathRule {
+                name: name.to_string(),
+                action: PolicyAction::Allow,
+                ops: vec![PathOp::Read, PathOp::Write, PathOp::List],
+                paths: vec![canon_allowed.to_string_lossy().to_string()],
+            }]
+        };
+
+        // reject_symlinks = true → the symlinked path is denied.
+        let strict = make_policy_reject_symlinks(rules("allow-all"), PolicyAction::Confirm, true);
+        assert_eq!(strict.evaluate(&link, PathOp::Read), PolicyAction::Deny);
+        assert_eq!(strict.evaluate(&link, PathOp::Write), PolicyAction::Deny);
+        // The real directory behind the link is still allowed.
+        assert_eq!(strict.evaluate(&allowed, PathOp::Read), PolicyAction::Allow);
+        assert_eq!(
+            strict.evaluate(&allowed.join("f.txt"), PathOp::Write),
+            PolicyAction::Allow
+        );
+
+        // reject_symlinks = false (the default) → today's canonicalizing
+        // behaviour: the link is followed to the allowed target.
+        let lenient = make_policy_reject_symlinks(rules("allow-all"), PolicyAction::Confirm, false);
+        assert_eq!(lenient.evaluate(&link, PathOp::Read), PolicyAction::Allow);
+        assert_eq!(lenient.evaluate(&link, PathOp::Write), PolicyAction::Allow);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_reject_symlink_checks_the_original_not_the_canonical_path() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir("reject_symlink_original");
+        let target = root.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = root.join("link");
+        symlink(&target, &link).unwrap();
+
+        // The original path IS a symlink...
+        assert!(PathPolicy::reject_symlink(&link));
+        // ...and its canonical form never is, which is exactly why the check
+        // has to run against the original (upstream shared.rs:664-668).
+        let canonical = std::fs::canonicalize(&link).unwrap();
+        assert!(!PathPolicy::reject_symlink(&canonical));
+        assert_eq!(canonical, std::fs::canonicalize(&target).unwrap());
+        // A plain directory and a non-existent path are not symlinks.
+        assert!(!PathPolicy::reject_symlink(&target));
+        assert!(!PathPolicy::reject_symlink(&root.join("does-not-exist")));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── validate_path_rules (upstream config/src/validate/semantic.rs:285) ───
+
+    fn rule_with_paths(name: &str, paths: &[&str]) -> PathRule {
+        PathRule {
+            name: name.to_string(),
+            action: PolicyAction::Allow,
+            ops: vec![PathOp::Read],
+            paths: paths.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_validate_path_rules_warns_on_relative_glob() {
+        let config = PathPolicyFileConfig {
+            rules: vec![rule_with_paths("dev", &["src/**"])],
+            ..Default::default()
+        };
+        let warnings = validate_path_rules(&config);
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        // The warning names the offending entry so it can be found.
+        assert!(warnings[0].contains("src/**"), "got: {}", warnings[0]);
+    }
+
+    #[test]
+    fn test_validate_path_rules_accepts_absolute_and_tilde_paths() {
+        let config = PathPolicyFileConfig {
+            rules: vec![rule_with_paths(
+                "dev",
+                &["/var/x", "~/y", "~", "**/secrets/**", "/home/a/**"],
+            )],
+            ..Default::default()
+        };
+        assert!(validate_path_rules(&config).is_empty());
+
+        // Empty config and empty rule paths are also clean.
+        assert!(validate_path_rules(&PathPolicyFileConfig::default()).is_empty());
+        let no_paths = PathPolicyFileConfig {
+            rules: vec![rule_with_paths("dev", &[])],
+            ..Default::default()
+        };
+        assert!(validate_path_rules(&no_paths).is_empty());
+    }
+
+    #[test]
+    fn test_validate_path_rules_is_warnings_only_never_errors() {
+        // A config full of bad globs still produces only warnings, so
+        // `PathPolicy::load` keeps loading it instead of falling back to safe
+        // defaults (which would be a far bigger behaviour change).
+        let config = PathPolicyFileConfig {
+            rules: vec![rule_with_paths("bad", &["src/**", "relative/dir", ""])],
+            ..Default::default()
+        };
+        let warnings = validate_path_rules(&config);
+        assert_eq!(warnings.len(), 3, "warnings: {warnings:?}");
     }
 }
