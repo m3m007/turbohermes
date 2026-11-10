@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "surfaces": {
+    "belief": 1,
+    "causal": 1,
+    "concept": 1,
+    "maintenance_trends": 1,
+    "policy": 1,
+    "recall_replay": 1,
+    "reflection_summaries": 1
+  }
+}
