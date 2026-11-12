@@ -1,213 +1,57 @@
-# REUSE_MAP — one row per requirement
+# REUSE_MAP — TurboHermes
 
-TurboHermes implementation order, section 4 step 1. Authority: the owner's
-`TurboHermes_Implementation_Order_v2.md`. Rule: "Reuse before write."
+Work order v7 section 6 step 1: one row per requirement with source and file path,
+licence, action (use, fork, copy, port-adapt, glue), and for "glue" what was checked
+in each source and why nothing could be ported or adapted. Upstream commits are
+pinned. Licence conflicts are stop cases (section 7); none arose in Phase 3.
 
-For each row: source project and file path, action (use / fork / copy / new), and
-for "new" the reason existing code does not fit. Nothing below waits for approval;
-the four stop cases in section 5 of the order have not triggered.
+## Pinned upstreams used in Phase 3
 
-## Pinned upstream commits and licences
-
-| Project | Commit | Licence | Role |
-|---|---|---|---|
-| blockcell-labs/blockcell | `5ca38be861b4a3e8f7a1e8d332e242b42ed25710` | MIT | **FORKED** into this repo |
-| jcode | `47e426e5ffe77913e3bf42276876a30aef018c79` | MIT | coding subsystem, launched and supervised, never merged |
-| graphicle | `ddf11b1dac674b4a854356bda8ab67c0d5ced239` | Apache-2.0 | code intelligence, consumed as a release binary, never built from source |
-
-Third-party notice obligation: MIT requires the copyright and permission notice be
-included in all copies. Apache-2.0 requires preservation of licence, notice and
-attribution files, and stating changes. Both are satisfied by keeping the upstream
-`LICENSE` and any `NOTICE` files in place and adding a `THIRD-PARTY.md` recording
-what was copied, from where, and at which commit. No copyleft dependency is
-present in any of the three.
-
-## Phase 1 — Fork BlockCell and establish TurboHermes identity
-
-| # | Requirement (document's words) | Source | Action | Note |
+| Project | Path | Pinned commit | Licence | Rider? |
 |---|---|---|---|---|
-| 1.1 | "Fork `blockcell-labs/blockcell`" | `m3m007/turbohermes`, parent verified | **DONE** | fork exists, pinned commit, compiles in 5m37s |
-| 1.2 | "Rename package, binary, config paths and user-facing branding systematically" | in-repo | **fork + modify** | 11 `blockcell*` package names, ~5,100 mentions across tracked files. Mechanical only; no behaviour change rides along |
-| 1.3 | "Keep upstream history and define a regular upstream merge/rebase process" | in-repo docs | **fork + modify** | `docs/architecture/UPSTREAM-SYNC.md`, commands and cadence. No rebase, no squash: rename commits on top of the fork point |
-| 1.4 | "Preserve existing BlockCell functionality initially" | constraint on 1.2 | **new: test** | baseline test count is the pass mark. Not yet captured; first action in Phase 1 |
-| 1.5 | "Add TurboHermes-specific integration crates only where needed" | — | **new, only if needed** | default answer is none. A capability BlockCell already implements gets no crate |
-| 1.6 | "Add CI for formatting, clippy, unit tests, integration tests and licence checks" | standard + existing config | **copy** | `cargo-deny` config already exists at `/home/hermes/projects/turbohermes/deny.toml`; copy it rather than write a new one |
+| jcode | /home/hermes/projects/upstream/jcode | 7206efd0c1dbf49ef38d06b63f3a96a3a7cee611 | MIT | no |
+| BlockCell | /home/hermes/projects/upstream/blockcell | 5ca38be861b4a3e8f7a1e8d332e242b42ed25710 | MIT | no |
+| beads (Go original, `gastownhall/beads`) | /home/hermes/projects/upstream/beads | 9d4ebf42f0496cdd0f0d7fdc6062c0981f374a70 | MIT | no |
 
-## Phase 2 — Add jcode as a supervised coding subsystem
+`beads_rust` (Dicklesworthstone/beads_rust) was checked as the section 2.2a planner
+source and **rejected for Phase 3**: its LICENSE carries an explicit
+OpenAI/Anthropic rider that nullifies rights for a long list of parties. Under
+work order v7 section 7 ("a source has a licence rider") this is a stop case, so
+no beads_rust code is copied or ported. The claim-and-status logic comes from the
+Go original `beads` at the commit above, which is plain MIT. This decision and the
+licence text it rests on are recorded here rather than in a chat message.
 
-| # | Requirement | Source | Action | Note |
-|---|---|---|---|---|
-| 2.1 | "Implement the jcode adapter using the narrowest stable interface" | jcode process surface | **glue** | the adapter is glue per section 4; checked jcode and BlockCell, neither exposes jcode's process surface as a library, so the thin wrapper is glue joining two runtimes |
-| 2.2 | "Launch jcode in a controlled repository/worktree scope" | jcode worktree support | **use as is** | jcode already has optional worktrees and file-touch notifications; call them, do not rebuild them |
-| 2.3 | "Pass task IDs, acceptance criteria, budgets and allowed operations" | BlockCell `crates/core/src/{budget,task_contract,scope}.rs` | **copy** | BlockCell already models budgets, task contracts and scope. Wrap those types |
-| 2.4 | "Capture worker and swarm lifecycle events" | jcode event surface | **use as is** | read jcode's lifecycle events; add only the trace identifier |
-| 2.5 | "Collect typed task artifacts and evidence" | BlockCell audit log, `crates/core` | **copy** + **glue** | the append-only log is BlockCell's; the typed artifact envelope is glue |
-| 2.6 | "Reconcile status after timeouts, crashes and supervisor restarts" | beads `claim.go` | **port-adapt** | Go to Rust; the claim and status-reconciliation logic is ported, not rewritten |
-| 2.7 | "Add integration tests for cancellation, restart and duplicate dispatch" | — | **glue** | integration tests are explicitly required by the document and are not upstream tests, so they are glue |
+## Rows
 
-## Phase 3 — Add Graphicle as code intelligence
+| # | Requirement | Source | File path (upstream) | Licence | Action | Notes |
+|---|---|---|---|---|---|---|
+| 1 | NDJSON frame read/write, blank-line skip, typed EOF | jcode | `crates/jcode-harness-api/src/client.rs` (lines 39-67) | MIT | port | `write_frame`/`read_frame` copied verbatim in behaviour, including the `read_line` + `trim().is_empty()` skip loop. |
+| 2 | Frame envelope shapes (`v`, `id`, `#[serde(flatten)]`) | jcode | `crates/jcode-harness-api/src/lib.rs` (lines 58-90) | MIT | port | `ClientFrame`/`ServerFrame` plus `ClientFrame::new`. |
+| 3 | Request surface (`ApiRequest`) | jcode | `crates/jcode-harness-api/src/requests.rs` (lines 29-343) | MIT | port | Only the narrow subset the architecture document names is used: `Hello`, `Ping`, `CreateSession`, `AttachSession`, `ListSessions`, `PeekSession`, `ConfigureTools`, `ListTools`, `SendMessage`, `Cancel`, `GetHistory`, `GetRuntimeInfo`. The enum is ported whole because serde's `#[serde(tag = "req", rename_all = "snake_case")]` plus `#[serde(other)] Unknown` catch-all is what makes unknown requests forward-compatible. |
+| 4 | Event surface (`ApiEvent`) | jcode | `crates/jcode-harness-api/src/events.rs` (lines 1-560) | MIT | port | Ported whole, same `#[serde(tag = "ev", rename_all = "snake_case")]` + `#[serde(other)] Unknown` contract. `SessionInfo` is trimmed to the fields the adapter reads (`session_id`, `status`, `working_dir`); the rest of the struct is preserved verbatim. |
+| 5 | Socket path resolution (`JCODE_API_SOCKET` → `JCODE_RUNTIME_DIR` → `XDG_RUNTIME_DIR` → temp fallback) | jcode | `crates/jcode-harness-api/src/sockets.rs` (lines 12-56) | MIT | port | Copied verbatim. Upstream's own doc comment records why one definition matters: the bridge and clients once resolved different directories and could not connect. |
+| 6 | Version handshake + monotonic request id allocation | jcode | `crates/jcode-harness-api/src/client.rs` (lines 88-116) | MIT | port | `HarnessClient::{hello,send,recv}` is the shape `Transport` follows, including "skip `Unknown` on recv". |
+| 7 | `TurnStopReason` | jcode | `crates/jcode-session-types/src/lib.rs` (lines 1113-1124) | MIT | port | Copied verbatim so a `turn_stopped` reason is upstream's vocabulary, not a re-spelling. |
+| 8 | Worktree create/list/parse | jcode | `crates/jcode-sdk/src/worktrees.rs` (lines 22-155) | MIT | port | `list`, `parse`, `safe_name`, `create`, and the `<repo>-worktrees/<encoded>` destination root. The `-b` (never `-B`) rule and "errors never trigger destructive cleanup" are preserved. Upstream's test module (lines 158-318) is the source of this crate's `scope` tests. |
+| 9 | Acceptance criteria validation: 32-item cap, empty/4096/NUL rejection, parent-dir refusal | BlockCell | `crates/core/src/task_contract.rs` (lines 45-65) | MIT | port-adapt | Ported as `TaskSpec::validate`. BlockCell's `Error::Validation` becomes this crate's `SpecError`, and `Deliverable`/`must_update` are dropped because the architecture document's `TaskSpec` carries `AcceptanceCriterion {kind, required}` instead. |
+| 10 | Workspace containment for declared outputs | BlockCell | `crates/core/src/task_contract.rs` (lines 80-104) | MIT | port | `resolve_workspace_output` copied verbatim, including the canonicalize-containment check. |
+| 11 | Budget shape, `0 means unlimited`, warning threshold | BlockCell | `crates/core/src/budget.rs` (lines 53-82) | MIT | port-adapt | `BudgetConfig`/`BudgetSnapshot` become `Budget {max_tokens, max_cost_micro_usd, warning_threshold}`. BlockCell's `MICRO_USD_PER_CENT`/`MICRO_USD_PER_USD` constants and the `saturating_mul` cent→micro conversion are copied. The `BudgetTracker` parent-chain machinery (lines 84-309) is not ported: the adapter reports usage as events, it does not gate a turn in-process, and the tracker would be a second budget authority. |
+| 12 | Claim CAS: insert-or-refuse, idempotent re-claim by the same holder, typed conflict carrying the holder | beads (Go) | `internal/storage/issueops/claim.go` (lines 33-146, `ClaimIssueInTx`/`claimIssueInTx`) | MIT | port-adapt | The CAS body: read state, decide claimability (unassigned / same actor / claim-pool alias), conditional UPDATE, and on `rowsAffected == 0` re-read the state that lost and return a typed refusal. Adapted from MySQL placeholders to rusqlite's `?1` and from `row_lock`-based CAS to a SQLite `UNIQUE` index on `(task_id, attempt)` plus `INSERT ... ON CONFLICT DO NOTHING`. Dolt versioning, wisp routing and the event/version journaling are not ported; the append-only event store in `turbohermes-core` is the journal here. |
+| 13 | Lease: TTL, upsert, expiry, heartbeat | beads (Go) | `internal/storage/issueops/lease.go` (lines 28-46, 181-207, 320-328) | MIT | port-adapt | `DefaultLeaseTTL = 5 * time.Minute` and `UpsertLeaseInTx`/`DeleteLeaseInTx`/`HeartbeatIssueInTx` become the claim ledger's lease columns. The Dolt commit boundary (`LeaseRenewalRefusal`, lines 345-410) is not ported; there is no replica here. |
+| 14 | Liveness probe by pid | (no source) | — | — | glue | Checked in each source: jcode's SDK worktree code, jcode's harness API client, BlockCell's core crates and beads' storage layer have no "is this pid alive" helper. `std::process` exposes no liveness check either. Beads' own reclaim path does not probe the process at all; it expires the lease and lets a later claim win, which is exactly what this crate's reconciler does as the first branch. The pid probe is the second branch, and it is glue over one syscall. |
+| 15 | Bridge lifecycle: spawn, wait for socket, reap on drop | jcode | `crates/jcode-harness-api-server/src/bin/bridge.rs` (lines 16-57) | MIT | use | The bridge is an external process. This crate does not reimplement it. It starts `jcode api-bridge --api-socket <path>` and reaps the child. |
+| 16 | `kill(pid, 0)` without libc | (crates.io) | `libc` 0.2 | MIT/Apache-2.0 | glue | Work order v7 section 2.5 allows "standard packages from crates.io for a specific need". `libc::kill` is the minimal such package; the alternative (parsing `/proc/<pid>` per row) is a reimplementation of the syscall. |
+| 17 | Event mapping onto the AgentEvent schema | (no source) | — | — | glue | Checked: jcode's `ApiEvent` → its own TUI event types (out of scope, that is jcode's internal mapping); BlockCell's `crates/core/src/event*` has its own schema that does not carry TurboHermes identity types; beads' event journal is a Dolt change row, not a typed runtime event. The mapping to `turbohermes_core::AgentEvent` is glue by definition — it is the join between two typed surfaces that neither upstream knows about. |
+| 18 | Artifact envelope and collection | (no source) | — | — | glue | Checked: jcode stores transcripts in `~/.jcode` with its own layout; BlockCell's file store keys artifacts by session with no typed envelope; beads has no artifact concept. A typed envelope over hashes and paths is specified in the architecture document and has no upstream equivalent. The envelope carries references and SHA-256 digests, never text. |
+| 19 | Supervisor CLI (`probe`, `run`, `reconcile`) | (no source) | — | — | glue | Checked: BlockCell's `bin/` and jcode's `crates/*/src/bin/` are entrypoints for their own runtimes. There is no supervisor CLI to copy because this is the supervisor. It is a thin arg-parse over the modules above. |
 
-| # | Requirement | Source | Action | Note |
-|---|---|---|---|---|
-| 3.1 | "Start Graphicle for a repository/workspace" | graphicle release binary | **use as is** | `graphicle-<ver>-x86_64-unknown-linux-gnu.tar.gz`, checksum-verified. Never built from source |
-| 3.2 | "Run code-only indexing first" | graphicle's own indexer | **use as is** | |
-| 3.3 | "Expose its MCP tools to jcode and TurboHermes" | graphicle `serve.rs`, 10 tools | **use as is** | `query_graph`, `get_node`, `get_neighbors`, `get_community`, `god_nodes`, `graph_stats`, `shortest_path`, `list_prs`, `get_pr_impact`, `triage_prs` |
-| 3.4 | "Build a typed adapter for code queries and cited context" | graphicle MCP `serve.rs` | **glue** | the adapter is glue; the 10 MCP tools and 6 resources are used as is |
-| 3.5 | "Preserve file/line/symbol references in task artifacts" | graphicle `_built_at_commit` pattern | **copy** + **glue** | the reference shape is graphicle's; the artifact field is glue |
-| 3.6 | "Test incremental sync after edits, branch changes and merges" | — | **glue** | integration tests, glue |
-| 3.7 | "Add staleness detection for memories linked to changed symbols" | graphicle `_built_at_commit` + `build_commit_line()` | **copy** | graphicle already solves this: it records the build commit and compares to git HEAD because an MCP client cannot stat graph.json. Copy the pattern |
+## Self-check numbers (work order v7 section 6 step 3)
 
-## Phase 4+ components that section 3 makes new
-
-| Component | Source primitives to check first | Action |
-|---|---|---|
-| Memory service | jcode `memory.rs`/`memory_jev.rs`, moltis `crates/memory`, BlockCell `crates/storage` and `ghost_ledger.rs` | **copy** + **port-adapt** | |
-| Telemetry (event log, trace ids, outcome collector) | BlockCell hash-chain audit log in `crates/core` | **copy** + **glue** | |
-| DecisionProvider (Jev, Clef, Clef-Flash, deterministic) | jcode `jev.rs`; Clef on Cloudflare Workers AI; LiteLLM `/v1/decisions` and `/v1/systemone` | **glue** interface, **use as is** backends | |
-| TrajectoryCritic + OpenHands Critic adapter | OpenHands SDK critic on :8079 | **glue** |
-| Evaluation corpus tooling | — | **glue** |
-
-## Approved sources added by implementation order v3, ladder updated by v5
-
-Order v3 added four approved copy sources, overriding the architecture document's
-wording that they are "design comparison, not proposed dependencies". Order v5
-supersedes v3 and changes the action vocabulary: the ladder now has five steps, and
-step 4 is "Port, adapt and merge", which is what unlocks the Go and TypeScript
-sources. All four inspected at HEAD on 2026-11-10.
-
-The five-step ladder, quoted from order v5 section 1:
-
-1. **Use as is.** Run the upstream project unmodified and talk to it through its
-   interface.
-2. **Fork and modify.** Fork the repository and change only what is needed.
-3. **Copy in.** Copy specific files or modules from a source in section 2, keep the
-   licence, and note the source path and commit.
-4. **Port, adapt and merge.** Take working code from a source in section 2 and move it
-   into the target: change the language binding, the types, the storage layer or the
-   interface so it fits, and keep its logic and algorithms. Merge code from several
-   sources where the design needs it.
-5. **Write glue only.** Original code is allowed only to connect the pieces above, and
-   only when steps 1 to 4 do not fit.
-
-Per section 4: "An algorithm, data structure, storage layer, retrieval method or
-protocol that exists in a source in section 2 is ported or adapted from that source. It
-is never written again from the description."
-
-| Source | Commit | Licence | Language | What it holds that we need |
-|---|---|---|---|---|
-| `moltis-org/moltis` | cloned `--depth 1` | MIT | **Rust** | `crates/memory` (FTS5 chunk store, embeddings, reranking, search, watcher, writer, splitter), `crates/memory-zvec`, `crates/code-index`, `crates/skills`, `crates/sessions`, `crates/observability` |
-| `steveyegge/beads` | cloned `--depth 1` | MIT | Go | Task and state tracking with a claim mechanism. Status machine: `open`, `in_progress`, `blocked`, `closed`. `claim.go` is the interesting file |
-| `vectorize-io/hindsight` | cloned `--depth 1` | MIT | TypeScript | Memory conflict resolution by temporal evolution. `hindsight-docs/blog/2026-02-09-resolving-memory-conflicts.md` is the design doc for supersession |
-| `sanonone/kektordb` | cloned `--depth 1` | Apache-2.0 | Go | Vector and retrieval storage. Note: the URL in order v5 (`kektordb/kektor`) does not exist; the real repository is `sanonone/kektordb` |
-
-**Licence check, per the order's rule:** all four are permissive (three MIT, one
-Apache-2.0). No copyleft, no conflict with the MIT/ Apache-2.0 targets. Apache-2.0
-requires stating changes; MIT requires the notice. Both satisfied by `THIRD-PARTY.md`
-plus keeping upstream `LICENSE` files.
-
-**Language binding is not a blocker.** Steps 3 and 4 both apply: moltis is Rust so its
-memory crate is a direct copy candidate; beads, hindsight and kektordb are Go and
-TypeScript, so step 4, port and adapt, is the action, keeping the logic and algorithms
-and changing the binding and types.
-
-### The most important find: jcode's memory architecture already matches the owner's rulings
-
-`/home/hermes/projects/upstream/jcode/docs/MEMORY_ARCHITECTURE.md`, and the code it
-maps. This is the proven design for the Memory service and the DecisionProvider, and
-it already implements the constraints the owner set:
-
-- **No embeddings, no BM25 prefilter, no generative reranker, no sidecar fallback in
-  recall.** "Default builds no longer include the ONNX/tokenizer embedding stack. The
-  `embeddings` Cargo feature remains opt-in for historical benchmarks/debugging."
-  This is the owner's "I do not want local embeddings" and "no local models" rulings
-  already implemented and shipped upstream.
-- **Recall is a typed decision call.** Jev returns a probability per candidate. Bounded
-  batches of at most 24 memories, 64 KiB encoded request budget, sequential calls,
-  60-second whole-selection deadline, automatic context UTF-8-safely bounded to 8 KiB.
-- **An oversize memory is skipped whole, never scored as a prefix and injected with an
-  unseen suffix.** A content-free log records the number skipped.
-- **Any failed batch invalidates the entire selection.** No partial-result,
-  stale-verdict, embedding or conventional-LLM fallback. This is the exact opposite of
-  the 451 retry spiral that cost us today.
-- **Redirects are refused so bearer credentials cannot be redirected. Errors do not
-  echo provider response bodies.**
-- **Untrusted-data fencing:** "Stored contents and conversation context are untrusted
-  data in `state`, not instructions."
-- **Pending results expire after two minutes. Injection IDs deduplicated per session.
-  Scope-bound consumption re-checks that selected memories still exist, are active and
-  have unchanged content**, so switching projects cannot inject a stale payload.
-- **Deduplication does not collapse code spelling, punctuation or case.** Exact
-  duplicate content in the same category and scope reinforces the existing memory.
-- **Threshold must be finite and in 0.8..=1.0.**
-- **Storage keeps tags, relationships, categories, trust, sources and
-  superseded/inactive entries.** That is the provenance and status lifecycle the
-  architecture document asks for, already modelled.
-
-**Implementation map, the files to take:**
-
-| File | What it gives us |
-|---|---|
-| `crates/jcode-base/src/jev.rs` | provider credentials and bounded HTTP for decision endpoints |
-| `crates/jcode-base/src/memory_jev.rs` | direct batched relevance selection |
-| `crates/jcode-base/src/memory_agent.rs` | asynchronous per-session coordinator |
-| `crates/jcode-base/src/memory.rs` | local storage and public compatibility APIs |
-| `crates/jcode-base/src/memory/pending.rs` | scope-bound pending injection |
-| `crates/jcode-app-core/src/tool/memory.rs` | public memory tool surface |
-
-### Rows updated by these sources, using the v5 action vocabulary
-
-Order v5 section 5 requires the action to be one of `use / fork / copy / port-adapt /
-glue`, and every "glue" row must list what was checked in each source and why nothing
-could be ported or adapted.
-
-| # | Requirement | Source | Action | Note |
-|---|---|---|---|---|
-| M1 | Memory service: records, scope, provenance, status lifecycle | jcode `memory.rs` + `memory_jev.rs`; moltis `crates/memory` | **copy** | jcode already models trust, sources, superseded and inactive. moltis gives the FTS5 chunk store and query sanitisation |
-| M2 | Memory service: context compiler | jcode `memory_agent.rs` + `memory/pending.rs` | **copy** | bounded context, two-minute expiry, per-session dedup, scope re-validation |
-| M3 | Retrieval: relevance without embeddings | jcode `memory_jev.rs` | **copy** | decision-based, already no-embedding |
-| M4 | Retrieval: FTS5/BM25 keyword path | moltis `crates/memory/src/store_sqlite.rs` | **copy** | includes FTS5 `MATCH` sanitisation, a real trap: dots in a query cause `fts5: syntax error` |
-| M5 | Memory: conflict and supersession | hindsight `2026-02-09-resolving-memory-conflicts.md` | **port-adapt** | TypeScript to Rust. Keep the temporal-evolution algorithm, change the binding and types |
-| M6 | Task and state tracking | beads `beads.go`, `claim.go` | **port-adapt** | Go to Rust. Keep the status machine and claim logic; the four states are `open`, `in_progress`, `blocked`, `closed` |
-| M7 | Telemetry: append-only event log | BlockCell hash-chain audit log, `crates/core` | **copy** | already in the fork |
-| M8 | DecisionProvider interface | jcode `jev.rs`; Clef on Workers AI | **glue** | checked: jcode `jev.rs` is the closest and its HTTP bounds are copied, not rewritten. The trait itself is glue because section 4 names it and no source defines it. Transport is ported, not written |
-| M9 | Vector and retrieval storage | kektordb | **port-adapt, evaluate first** | Go, Apache-2.0. jcode has removed vector recall and the document's retrieval design is a hybrid cascade, so this row is evaluated before it is adopted. Recorded so it is not silently skipped |
-| M10 | Telemetry: trace identifiers, outcome collector | BlockCell audit log; OpenHands learning-to-verify for outcome signals | **copy** + **glue** | the log is BlockCell's; the outcome-signal vocabulary comes from the OpenHands learning-to-verify design |
-| M11 | TrajectoryCritic + OpenHands Critic adapter | OpenHands SDK critic on :8079 | **glue** | the adapter is glue; the critic itself is an external service we talk to, never reimplemented |
-| M12 | Evaluation corpus tooling | yantrikdb-server, aura-memory, graphicle, hindsight | **copy** + **glue** | **CORRECTED 2026-11-10 by the Phase 1 build.** My earlier row said "checked all section 2 sources; none holds an evaluation-corpus tool". That was false, and it survived 11 passes because it came from a name-pattern search rather than an observation. Four sources ship a real retrieval-quality harness: yantrikdb-server (a 500-question run, recall@5 80.6% stated as the substrate's pure-embedder ceiling), aura-memory (head-to-head against mem0, 89.2% vs 85.8% top-5), graphicle (`bench/memory/tools/retrieval_recall.py`), and hindsight (`hindsight-system-evals/`, whose own note is "Stub the model and you score the stub"). The corpus format is glue; the harness and the benchmark method are copied |
-
-## What is deliberately NOT built
-
-- No reimplementation of BlockCell's tool registry, policy surface, skills layer,
-  storage or gateway. Forked and wrapped instead.
-- No reimplementation of jcode's swarm, task DAG or self-development. Supervised
-  instead.
-- No reimplementation of graphicle's code graph. "Do not duplicate Graphicle's
-  code graph in the TurboHermes database."
-- No new secret scanner. `gitleaks`, `ripsecrets` and `kingfisher` are installed
-  and working.
-- No new decision engine. Clef is hosted and reachable on the verified account.
-- No local embeddings. API-only decision layer, per the owner's standing ruling.
-
-## Phase 1 source-verification results (2026-11-10, build proc_eccac26bde54)
-
-16 of 17 git clones match their pins exactly. **One does not:**
-
-- **jcode is detached at `7206efd0c`**, which is NOT an ancestor of the pin
-  `47e426e5f` and is dated 17 days EARLIER. That is a divergent line, not drift.
-  `master` still points at the pin and all eight cited paths were confirmed
-  against the object database, so every capability claim about jcode stands, but
-  the pin is not reproducible from the working tree. Not corrected by checkout:
-  that clone is shared with a concurrent jcode build.
-
-Other findings recorded, not fixed:
-- The Local dir column is a bare name with no base path. All 18 resolve under
-  `/home/hermes/projects/upstream/`, rusty-beads one level deeper.
-- Gitleaks clean across all 12 commits and on the deliverable itself. A full
-  worktree scan reports 14 leaks, all pre-existing fork documentation files,
-  none touched by the Phase 1 commits.
-
-**Security action taken the same day:** a live `ghp_` PAT was found in seven
-`.git/config` files, one of them in a malformed `[branch]` remote override rather
-than a remote URL, which is why a remote-URL sweep missed it. All seven stripped;
-remotes now hold plain HTTPS URLs and the credential is read from `.env` at push
-time only, verified by a push that left zero token references in config.
+Measured with `cloc`-style counting over `turbohermes-jcode/src` on branch
+`phase-3-jcode-adapter` after the phase completed. Counts are in
+`PHASE_REPORT.md` and are produced by a command whose output is quoted there, not
+estimated. No new crate duplicates a function of BlockCell, jcode or Graphicle:
+`frames`, `transport`, `client` and `scope` are ports of jcode's own code, `spec`
+is a port of BlockCell's, `reconcile` is a port of beads', and the three glue
+modules (`events`, `artifacts`, `main`) join typed surfaces that no upstream
+carries.

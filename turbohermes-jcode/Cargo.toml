@@ -1,0 +1,23 @@
+[package]
+name = "turbohermes-jcode"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "The jcode adapter for TurboHermes: a narrow typed client over jcode's stable harness API, a controlled worktree scope, lifecycle capture into the shared event store, typed artifacts, and claim reconciliation after timeout, crash and restart."
+repository = "https://github.com/1jehuang/jcode"
+readme = "README.md"
+
+[dependencies]
+turbohermes-core = { path = "../turbohermes-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
+libc = "0.2"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "turbohermes-jcode"
+path = "src/main.rs"
