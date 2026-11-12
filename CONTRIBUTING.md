@@ -1,5 +1,10 @@
 # Contributing to TurboHermes / 参与 TurboHermes 贡献
 
+> TurboHermes is research code forked from BlockCell. We are not seeking upstream parity.
+> TurboHermes 是基于 BlockCell fork 的研究代码，不追求 upstream 功能对等。
+
+---
+
 Thank you for helping improve TurboHermes. This guide describes the basic expectations for issues, code changes, and pull requests.
 
 感谢你帮助改进 TurboHermes。本文说明提交问题、修改代码和准备 Pull Request 时应遵循的基本约定。
@@ -10,7 +15,7 @@ Thank you for helping improve TurboHermes. This guide describes the basic expect
 - For substantial features or architectural changes, open an issue first to align on scope and compatibility.
 - Never include API keys, tokens, passwords, or personal data in public issues, logs, fixtures, or commits.
 
-- 对缺陷修复，请描述复现步骤、预期行为、实际行为以及运行环境。
+- For bug fixes，请描述复现步骤、预期行为、实际行为以及运行环境。
 - 对较大的功能或架构变更，建议先创建 issue，确认范围和兼容性要求。
 - 不要在公开 issue、日志、测试数据或提交中包含 API Key、Token、密码及个人数据。
 
@@ -18,7 +23,7 @@ Thank you for helping improve TurboHermes. This guide describes the basic expect
 
 TurboHermes is a Rust 2021 workspace with a minimum supported Rust version of 1.96 (the toolchain is pinned in `rust-toolchain.toml` and kept in sync with `rust-version` in `Cargo.toml`). After cloning the repository, run:
 
-TurboHermes 是 Rust 2021 workspace，最低支持 Rust 1.96（工具链版本固定在 `rust-toolchain.toml`，与 `Cargo.toml` 的 `rust-version` 保持一致）。克隆仓库后可运行：
+TurboHermes (forked from BlockCell) is a Rust 2021 workspace，最低支持 Rust 1.96（工具链版本固定在 `rust-toolchain.toml`，与 `Cargo.toml` 的 `rust-version` 保持一致）。克隆仓库后可运行：
 
 ```bash
 cargo build --workspace

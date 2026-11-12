@@ -1,3 +1,16 @@
+## What is TurboHermes / TurboHermes 是什么
+
+TurboHermes is research code forked from [BlockCell](https://github.com/blockcell-labs/blockcell), a self-evolving Rust agent framework. We are not chasing upstream feature parity. Our direction in v9 is contract-first coding harness integration, bi-temporal world models, and deterministic offline prose tooling — things BlockCell was not designed for.
+
+TurboHermes 是基于 [BlockCell](https://github.com/blockcell-labs/blockcell) fork 的研究代码。我们不追求 upstream 功能对等。v9 方向是 contract-first coding harness 集成、双时态世界模型、以及确定性离线 prose 工具链 —— 这些都不是 BlockCell 原本的设计目标。
+
+> **Status:** Research code. Breaking changes are expected. Production use requires pinning a commit.
+
+> **状态：** 研究代码。预期会有 breaking changes。生产使用请锁定特定 commit。
+
+---
+
+
 ## 🌟 What Makes BlockCell Different
 
 
@@ -20,7 +33,7 @@ BlockCell: ✓ Sets up monitoring → ✓ Checks price every hour → ✓ Sends 
 
 ## 🌟 BlockCell 有何不同
 
-BlockCell 不只是一个聊天机器人 — 它是一个**真正能执行任务**的 AI 智能体。当 ChatGPT 只能告诉你该做什么时，BlockCell 可以：
+TurboHermes 不只是一个聊天机器人 — 它是一个**真正能执行任务**的 AI 智能体。当 ChatGPT 只能告诉你该做什么时，BlockCell 可以：
 
 - 📁 读写你系统上的文件
 - 🌐 控制浏览器并自动化网页任务
@@ -66,9 +79,9 @@ Traditional software dies the moment it ships. BlockCell is meant to be **alive*
 - **Block** → 不可变的 Rust 宿主：安全、稳定、确定性
 - **Cell** → 可变的技能层：有生命、能自我修复、无限进化
 
-传统软件在发布的那一刻就停止了生长。BlockCell 是**活的**。
+传统软件在发布的那一刻就停止了生长。TurboHermes 是**活的**。
 
-→ [完整命名故事](https://blockcell.dev/naming-story)
+→ [完整命名故事](https://blockcell.dev/naming-story)  （BlockCell 命名故事；TurboHermes 继承此哲学）
 
 ---
 
@@ -1181,3 +1194,53 @@ BlockCell 站在巨人的肩膀上：
 [⭐ 在 GitHub 上 Star](https://github.com/blockcell-labs/blockcell) • [📖 阅读文档](https://blockcell.dev/docs) • [💬 加入 Discord](https://discord.gg/E8TXuHk9QZ)
 
 </div>
+
+---
+
+## Technical Appendix / 技术附录
+
+This appendix covers the underlying BlockCell mechanisms for readers who need implementation detail. Casual users can skip this.
+
+本附录面向需要实现细节的读者，说明底层 BlockCell 机制。普通用户可以跳过。
+
+### Runtime Kernel / 运行时内核
+
+The v0.1.8 runtime kernel introduces an event bus (`EventBus`), a serial interception chain (`Waterfall`), and unified scope primitives (`ScopedRegistry` / `ScopeGuard`). Events are dispatched by priority and scope filtering, and listeners support timeout and failure isolation (fail-open / fail-closed).
+
+v0.1.8 运行时内核引入了事件总线（`EventBus`）、串行拦截链（`Waterfall`）和统一作用域原语（`ScopedRegistry` / `ScopeGuard`）。事件按优先级和作用域过滤分发，监听器支持超时和故障隔离（fail-open / fail-closed）。
+
+### Agent Lifecycle Events / Agent 生命周期事件
+
+The system emits `agent/pre-step`, `agent/request`, `agent/request-error`, `turn/start`, `turn/end`, `step/start`, `step/end`, `tool/pre-execute`, `tool/post-execute`, `tool/result`, `model/response`, `assistant/attempt`, `memory/write`, `subagent/spawn`, `subagent/completed`, `evolution/deployed`, `compaction/start`, and `compaction/end` events, classified by Durable / Live / Capability consistency semantics.
+
+系统发出 `agent/pre-step`、`agent/request`、`agent/request-error`、`turn/start`、`turn/end`、`step/start`、`step/end`、`tool/pre-execute`、`tool/post-execute`、`tool/result`、`model/response`、`assistant/attempt`、`memory/write`、`subagent/spawn`、`subagent/completed`、`evolution/deployed`、`compaction/start`、`compaction/end` 事件，按 Durable / Live / Capability consistency 语义分类。
+
+### Guarded Tool Pipeline /  guarded tool pipeline
+
+Tool toggles, policy, dangerous-operation, path-access, and shell-escalation checks are centralized into one pipeline; individual tools no longer handle permissions, approvals, or auditing themselves.
+
+工具开关、策略、危险操作、路径访问和 shell 升级检查集中到一个 pipeline；各个工具不再自行处理权限、审批或审计。
+
+### Failure Semantics / 失败语义
+
+`FailureKind`, `Idempotency`, and `ToolOutcome` distinguish failed / rejected / cancelled / timed-out / not-started / unknown. Unknown outcomes are reconciled before retry. Model request errors pick a recovery strategy by type: compact-then-retry on context overflow, backoff on rate limit, provider switch on auth failure.
+
+`FailureKind`、`Idempotency` 和 `ToolOutcome` 区分 failed / rejected / cancelled / timed-out / not-started / unknown。未知结果在重试前进行核对。模型请求错误按类型选择恢复策略：上下文溢出时 compact-then-retry，速率限制时 backoff，认证失败时切换 provider。
+
+### Session Event Log and Replay / 会话事件日志与回放
+
+An append-only JSONL sidecar (`schema_version`, monotonic `seq`, retention cleanup) runs alongside the transcript. `blockcell session list / replay / verify` replays turns, steps, model requests, and tool calls. `SessionMetrics` reports turn / step / tool-outcome / retry / token / duration metrics.
+
+一个仅追加的 JSONL 伴生文件（`schema_version`、单调递增 `seq`、保留清理）与 transcript 并行运行。`blockcell session list / replay / verify` 可回放 turns、steps、模型请求和工具调用。`SessionMetrics` 报告 turn / step / tool-outcome / retry / token / duration 指标。
+
+### Compaction and Context Injection / 压缩与上下文注入
+
+Compaction is abstracted into a `ContextCompactor` strategy (`ModelSummaryCompactor` / `ExtractiveCompactor`). The `agent/pre-step` decision gate consolidates budget, compaction, and context injection, and supports a registrable policy chain that can rewrite or stop the step.
+
+压缩被抽象为 `ContextCompactor` 策略（`ModelSummaryCompactor` / `ExtractiveCompactor`）。`agent/pre-step` 决策门合并预算、压缩和上下文注入，支持可注册策略链来重写或停止 step。
+
+### Evolution Isolation / 进化隔离
+
+The Evolution Candidate Scope and evolution trust boundary keep candidate skills / prompts / policies visible only inside a view that explicitly enters candidate evaluation.
+
+Evolution Candidate Scope 和 evolution trust boundary 确保候选 skill / prompt / policy 只在显式进入候选评估的视图中可见。
